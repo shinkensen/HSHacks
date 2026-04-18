@@ -42,6 +42,7 @@ const HAND_MODEL_FALLBACK_URL =
   'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task'
 const WASM_URL =
   'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.34/wasm'
+const MEDIAPIPE_DELEGATE: 'CPU' | 'GPU' = 'CPU'
 
 const POSE_MIN_VIS = 0.45
 const MIN_REP_DOWN_ANGLE = 108
@@ -283,7 +284,7 @@ export default function Home() {
       try {
         const vision = await FilesetResolver.forVisionTasks(WASM_URL)
         const poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
-          baseOptions: { modelAssetPath: MODEL_URL, delegate: 'GPU' },
+          baseOptions: { modelAssetPath: MODEL_URL, delegate: MEDIAPIPE_DELEGATE },
           runningMode: 'VIDEO',
           numPoses: 1,
           outputSegmentationMasks: false, // Disabled mask to prevent memory leak and remove goofy visual
@@ -292,13 +293,13 @@ export default function Home() {
         let handLandmarker: HandLandmarker
         try {
           handLandmarker = await HandLandmarker.createFromOptions(vision, {
-            baseOptions: { modelAssetPath: HAND_MODEL_LOCAL_URL, delegate: 'GPU' },
+            baseOptions: { modelAssetPath: HAND_MODEL_LOCAL_URL, delegate: MEDIAPIPE_DELEGATE },
             runningMode: 'VIDEO',
             numHands: 2,
           })
         } catch {
           handLandmarker = await HandLandmarker.createFromOptions(vision, {
-            baseOptions: { modelAssetPath: HAND_MODEL_FALLBACK_URL, delegate: 'GPU' },
+            baseOptions: { modelAssetPath: HAND_MODEL_FALLBACK_URL, delegate: MEDIAPIPE_DELEGATE },
             runningMode: 'VIDEO',
             numHands: 2,
           })

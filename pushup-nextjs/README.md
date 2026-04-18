@@ -1,5 +1,31 @@
 This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
 
+## Multi-Camera Room Sharing
+
+The app can share landmarks between devices in the same room ID.
+
+- Local network mode:
+	The devices call the app API at `/api/rooms/[roomId]/landmarks`.
+	This works best when all devices can reach the same host URL.
+- Cloud mode:
+	Configure Upstash Redis and deploy the app. Device feeds are persisted in Redis,
+	which is much more reliable than process memory when networks are finicky.
+
+### Cloud Relay Setup (Upstash)
+
+1. Create an Upstash Redis database.
+2. Copy the REST URL and REST token.
+3. Add them to `.env.local`:
+
+```bash
+UPSTASH_REDIS_REST_URL=...
+UPSTASH_REDIS_REST_TOKEN=...
+```
+
+4. Run or deploy the app.
+
+If env vars are not provided, relay storage falls back to in-memory mode.
+
 ## Getting Started
 
 First, run the development server:
