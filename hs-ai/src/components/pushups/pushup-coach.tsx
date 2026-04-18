@@ -84,20 +84,22 @@ const POSE_MIN_VIS = 0.45;
 const MIN_REP_UP_ANGLE = 148;
 const MIN_REP_FRAMES = 2;
 const MIN_HIP_HEIGHT_DELTA = 0.025;
-const MIN_SHOULDER_HEIGHT_DELTA = 0.018;
+const MIN_SHOULDER_HEIGHT_DELTA = 0.012;
 const MIN_ELBOW_EXCURSION = 45;
-const MIN_ELBOW_EXCURSION_FRONTAL = 36;
+const MIN_ELBOW_EXCURSION_FRONTAL = 30;
 const ELBOW_ALPHA = 0.42;
 const BODY_ALPHA = 0.22;
 const REP_COOLDOWN_MS = 280;
 const REP_COOLDOWN_MS_FRONTAL = 340;
 const REP_COOLDOWN_MS_FAST = 180;
 const REP_COOLDOWN_MS_FRONTAL_FAST = 220;
-const MAX_FRONTAL_ELBOW_ASYMMETRY = 28;
+const MAX_FRONTAL_ELBOW_ASYMMETRY = 40;
 const FAST_REP_MIN_DOWN_HOLD_MS = 45;
 const FAST_REP_MIN_DOWN_HOLD_MS_FRONTAL = 60;
-const FAST_REP_DEPTH_MULTIPLIER = 1.2;
+const FAST_REP_DEPTH_MULTIPLIER = 1.1;
 const FAST_REP_ELBOW_BONUS = 10;
+const STRONG_DEPTH_MULTIPLIER = 1.65;
+const STRONG_EXCURSION_BONUS = 18;
 const MOTION_SAMPLE_INTERVAL_MS = 400;
 const MAX_MOTION_SAMPLES = 360;
 const SHARE_PUSH_INTERVAL_MS = 100;
@@ -1402,9 +1404,7 @@ export function PushupCoach() {
       isVisible(leftShoulder) &&
       isVisible(rightShoulder) &&
       isVisible(leftElbow) &&
-      isVisible(rightElbow) &&
-      isVisible(leftWrist) &&
-      isVisible(rightWrist);
+      isVisible(rightElbow);
 
     if (!side.valid && !frontalReady) {
       setStatusText("Low landmark confidence. Keep full body in frame.");
@@ -1573,6 +1573,14 @@ export function PushupCoach() {
         elbowExcursion >=
         (frontalMode ? MIN_ELBOW_EXCURSION_FRONTAL : MIN_ELBOW_EXCURSION) +
           FAST_REP_ELBOW_BONUS;
+      const strongDepthOk = frontalMode
+        ? normalizedShoulderDepth >=
+          MIN_SHOULDER_HEIGHT_DELTA * STRONG_DEPTH_MULTIPLIER
+        : false;
+      const strongExcursionOk = frontalMode
+        ? elbowExcursion >=
+          MIN_ELBOW_EXCURSION_FRONTAL + STRONG_EXCURSION_BONUS
+        : false;
       const fastRepCandidate =
         downDurationMs >=
           (frontalMode
@@ -1591,12 +1599,17 @@ export function PushupCoach() {
       const cooldownPassed = now - lastRepAtRef.current >= cooldownTargetMs;
       const downHeldEnough =
         downDurationMs >= (frontalMode ? 110 : 80) || fastRepCandidate;
+      const frontalCountOk = frontalMode
+        ? (depthOk && excursionOk) ||
+          (depthOk && strongExcursionOk) ||
+          (excursionOk && strongDepthOk)
+        : depthOk || excursionOk;
 
       if (
         cooldownPassed &&
         downHeldEnough &&
         symmetryOk &&
-        ((depthOk && excursionOk) || (!frontalMode && (depthOk || excursionOk)))
+        frontalCountOk
       ) {
         setRepCount((p) => p + 1);
         const repNow = Date.now();
