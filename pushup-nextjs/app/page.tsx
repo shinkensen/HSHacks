@@ -14,9 +14,25 @@ type Stage = 'up' | 'down'
 type SideMetrics = {
   elbowAngle: number
   bodyAngle: number
+  hipAngle: number
+  elbowTorsoAngle: number
   wristShoulderDx: number
   quality: number
   valid: boolean
+}
+
+type WireLandmark = {
+  x: number
+  y: number
+  z: number
+  visibility?: number
+}
+
+type RemoteDeviceFeed = {
+  deviceId: string
+  updatedAt: number
+  poseLandmarks: WireLandmark[]
+  handLandmarks: WireLandmark[][]
 }
 
 const MODEL_URL =
@@ -27,13 +43,30 @@ const HAND_MODEL_FALLBACK_URL =
 const WASM_URL =
   'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.34/wasm'
 
-const POSE_MIN_VIS = 0.55
-const MIN_REP_DOWN_ANGLE = 95
-const MIN_REP_UP_ANGLE = 158
-const MIN_REP_FRAMES = 3
-const MIN_HIP_HEIGHT_DELTA = 0.045
-const ELBOW_ALPHA = 0.3
+const POSE_MIN_VIS = 0.45
+const MIN_REP_DOWN_ANGLE = 108
+const MIN_REP_UP_ANGLE = 148
+const MIN_REP_FRAMES = 2
+const MIN_HIP_HEIGHT_DELTA = 0.025
+const MIN_ELBOW_EXCURSION = 45
+const ELBOW_ALPHA = 0.42
 const BODY_ALPHA = 0.22
+const REP_COOLDOWN_MS = 280
+const SHARE_PUSH_INTERVAL_MS = 100
+const SHARE_PULL_INTERVAL_MS = 180
+
+const SHOULDER_L = 11
+const SHOULDER_R = 12
+const ELBOW_L = 13
+const ELBOW_R = 14
+const WRIST_L = 15
+const WRIST_R = 16
+const HIP_L = 23
+const HIP_R = 24
+const KNEE_L = 25
+const KNEE_R = 26
+const ANKLE_L = 27
+const ANKLE_R = 28
 
 function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value))
@@ -51,6 +84,15 @@ function angleABC(a: Landmark, b: Landmark, c: Landmark) {
   return (Math.acos(cosine) * 180) / Math.PI
 }
 
+function angleBetween(v1: { x: number; y: number }, v2: { x: number; y: number }) {
+  const dot = v1.x * v2.x + v1.y * v2.y
+  const magV1 = Math.hypot(v1.x, v1.y)
+  const magV2 = Math.hypot(v2.x, v2.y)
+  if (magV1 === 0 || magV2 === 0) return 0
+  const cosine = clamp(dot / (magV1 * magV2), -1, 1)
+  return (Math.acos(cosine) * 180) / Math.PI
+}
+
 function distance2D(a: Landmark, b: Landmark) {
   return Math.hypot(a.x - b.x, a.y - b.y)
 }
@@ -64,6 +106,29 @@ function ema(next: number, prev: number | null, alpha: number) {
   return prev + alpha * (next - prev)
 }
 
+function randomId() {
+  return Math.random().toString(36).slice(2, 10)
+}
+
+function normalizeWireLandmarks(landmarks: WireLandmark[] | undefined): Landmark[] {
+  if (!landmarks) return []
+  return landmarks.map((lm) => ({
+    x: lm.x,
+    y: lm.y,
+    z: lm.z,
+    visibility: lm.visibility ?? 1,
+  }))
+}
+
+function roomColorFromId(deviceId: string) {
+  const palette = ['#ffd166', '#ef476f', '#06d6a0', '#4cc9f0', '#f78c6b', '#b8f2e6']
+  let hash = 0
+  for (let i = 0; i < deviceId.length; i += 1) {
+    hash = (hash * 31 + deviceId.charCodeAt(i)) >>> 0
+  }
+  return palette[hash % palette.length]
+}
+
 export default function Home() {
   const [isCameraOn, setIsCameraOn] = useState(false)
   const [statusText, setStatusText] = useState('Loading models...')
@@ -72,6 +137,10 @@ export default function Home() {
   const [handsDetected, setHandsDetected] = useState(0)
   const [elapsedSeconds, setElapsedSeconds] = useState(0)
   const [feedback, setFeedback] = useState<string[]>(['Press Start Camera and begin pushups in profile view.'])
+  const [relayOrigin, setRelayOrigin] = useState('')
+  const [roomId, setRoomId] = useState('')
+  const [shareEnabled, setShareEnabled] = useState(false)
+  const [remoteFeeds, setRemoteFeeds] = useState<RemoteDeviceFeed[]>([])
 
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
@@ -89,12 +158,69 @@ export default function Home() {
   const topHipYRef = useRef<number | null>(null)
   const elbowEmaRef = useRef<number | null>(null)
   const bodyEmaRef = useRef<number | null>(null)
+  const cycleMinElbowRef = useRef<number | null>(null)
+  const cycleMaxElbowRef = useRef<number | null>(null)
+  const upAngleBaselineRef = useRef<number | null>(null)
+  const downStartedAtRef = useRef<number | null>(null)
+  const lastRepAtRef = useRef(0)
+  const deviceIdRef = useRef('dev-pending')
+  const lastSharePushAtRef = useRef(0)
+  const remoteFeedsRef = useRef<RemoteDeviceFeed[]>([])
 
   function formatDuration(totalSeconds: number) {
     const minutes = Math.floor(totalSeconds / 60)
     const seconds = totalSeconds % 60
     return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
   }
+
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      setRelayOrigin(window.location.origin)
+      if (deviceIdRef.current === 'dev-pending') {
+        deviceIdRef.current = `dev-${randomId()}`
+      }
+    }
+  }, [])
+
+  useEffect(() => {
+    remoteFeedsRef.current = remoteFeeds
+  }, [remoteFeeds])
+
+  useEffect(() => {
+    if (!shareEnabled || !roomId.trim() || !relayOrigin.trim()) {
+      setRemoteFeeds([])
+      return
+    }
+
+    let stopped = false
+
+    async function pullRoomFeeds() {
+      try {
+        const response = await fetch(
+          `${relayOrigin}/api/rooms/${encodeURIComponent(roomId.trim())}/landmarks`,
+          { cache: 'no-store' },
+        )
+        if (!response.ok || stopped) {
+          return
+        }
+        const data = (await response.json()) as { devices?: RemoteDeviceFeed[] }
+        const devices = (data.devices ?? []).filter((d) => d.deviceId !== deviceIdRef.current)
+        setRemoteFeeds(devices)
+      } catch {
+        if (!stopped) {
+          setStatusText('Room relay unreachable. Check local network URL.')
+        }
+      }
+    }
+
+    pullRoomFeeds()
+    const interval = window.setInterval(pullRoomFeeds, SHARE_PULL_INTERVAL_MS)
+
+    return () => {
+      stopped = true
+      window.clearInterval(interval)
+    }
+  }, [shareEnabled, roomId, relayOrigin])
 
   function stopTimer() {
     if (timerRef.current !== null) {
@@ -144,6 +270,11 @@ export default function Home() {
     topHipYRef.current = null
     elbowEmaRef.current = null
     bodyEmaRef.current = null
+    cycleMinElbowRef.current = null
+    cycleMaxElbowRef.current = null
+    upAngleBaselineRef.current = null
+    downStartedAtRef.current = null
+    lastRepAtRef.current = 0
   }
 
   useEffect(() => {
@@ -197,30 +328,51 @@ export default function Home() {
   }, [])
 
   function getSideMetrics(landmarks: Landmark[], side: 'left' | 'right'): SideMetrics {
-    const shoulder = side === 'left' ? landmarks[11] : landmarks[12]
-    const elbow = side === 'left' ? landmarks[13] : landmarks[14]
-    const wrist = side === 'left' ? landmarks[15] : landmarks[16]
-    const hip = side === 'left' ? landmarks[23] : landmarks[24]
-    const ankle = side === 'left' ? landmarks[27] : landmarks[28]
+    const shoulder = side === 'left' ? landmarks[SHOULDER_L] : landmarks[SHOULDER_R]
+    const elbow = side === 'left' ? landmarks[ELBOW_L] : landmarks[ELBOW_R]
+    const wrist = side === 'left' ? landmarks[WRIST_L] : landmarks[WRIST_R]
+    const hip = side === 'left' ? landmarks[HIP_L] : landmarks[HIP_R]
+    const knee = side === 'left' ? landmarks[KNEE_L] : landmarks[KNEE_R]
+    const ankle = side === 'left' ? landmarks[ANKLE_L] : landmarks[ANKLE_R]
 
-    const required = [shoulder, elbow, wrist, hip, ankle]
+    const required = [shoulder, elbow, wrist, hip, knee, ankle]
     const visibleCount = required.filter((lm) => isVisible(lm)).length
     const quality = visibleCount / required.length
-    const valid = visibleCount === required.length
+    const valid = isVisible(shoulder) && isVisible(elbow) && isVisible(wrist) && isVisible(hip)
 
     if (!valid) {
       return {
         elbowAngle: 0,
         bodyAngle: 0,
+        hipAngle: 0,
+        elbowTorsoAngle: 0,
         wristShoulderDx: 0,
         quality,
         valid: false,
       }
     }
 
+    const upperArm = {
+      x: elbow!.x - shoulder!.x,
+      y: elbow!.y - shoulder!.y,
+    }
+    const torso = {
+      x: hip!.x - shoulder!.x,
+      y: hip!.y - shoulder!.y,
+    }
+
+    const bodyAngle = isVisible(ankle)
+      ? angleABC(shoulder!, hip!, ankle!)
+      : 180
+    const hipAngle = isVisible(knee)
+      ? angleABC(shoulder!, hip!, knee!)
+      : 180
+
     return {
       elbowAngle: angleABC(shoulder!, elbow!, wrist!),
-      bodyAngle: angleABC(shoulder!, hip!, ankle!),
+      bodyAngle,
+      hipAngle,
+      elbowTorsoAngle: angleBetween(upperArm, torso),
       wristShoulderDx: Math.abs(wrist!.x - shoulder!.x),
       quality,
       valid: true,
@@ -245,10 +397,17 @@ export default function Home() {
     elbowEmaRef.current = smoothedElbow
     bodyEmaRef.current = smoothedBody
 
-    const leftHip = landmarks[23]
-    const rightHip = landmarks[24]
-    const leftShoulder = landmarks[11]
-    const rightShoulder = landmarks[12]
+    if (cycleMinElbowRef.current === null || smoothedElbow < cycleMinElbowRef.current) {
+      cycleMinElbowRef.current = smoothedElbow
+    }
+    if (cycleMaxElbowRef.current === null || smoothedElbow > cycleMaxElbowRef.current) {
+      cycleMaxElbowRef.current = smoothedElbow
+    }
+
+    const leftHip = landmarks[HIP_L]
+    const rightHip = landmarks[HIP_R]
+    const leftShoulder = landmarks[SHOULDER_L]
+    const rightShoulder = landmarks[SHOULDER_R]
     const shoulderWidth = isVisible(leftShoulder) && isVisible(rightShoulder)
       ? distance2D(leftShoulder!, rightShoulder!)
       : 0.15
@@ -262,6 +421,9 @@ export default function Home() {
       if (topHipYRef.current === null || hipY < topHipYRef.current) {
         topHipYRef.current = hipY
       }
+      if (smoothedElbow > 140) {
+        upAngleBaselineRef.current = ema(smoothedElbow, upAngleBaselineRef.current, 0.12)
+      }
     }
     if (stageRef.current === 'down') {
       if (bottomHipYRef.current === null || hipY > bottomHipYRef.current) {
@@ -269,8 +431,11 @@ export default function Home() {
       }
     }
 
-    const isDownNow = smoothedElbow <= MIN_REP_DOWN_ANGLE
-    const isUpNow = smoothedElbow >= MIN_REP_UP_ANGLE
+    const upThreshold = clamp((upAngleBaselineRef.current ?? MIN_REP_UP_ANGLE) - 8, 142, 170)
+    const downThreshold = clamp(upThreshold - 48, 90, 122)
+
+    const isDownNow = smoothedElbow <= downThreshold
+    const isUpNow = smoothedElbow >= upThreshold
 
     if (isDownNow) {
       downFrameCountRef.current += 1
@@ -287,6 +452,7 @@ export default function Home() {
     if (stageRef.current === 'up' && downFrameCountRef.current >= MIN_REP_FRAMES) {
       stageRef.current = 'down'
       bottomHipYRef.current = hipY
+      downStartedAtRef.current = performance.now()
     }
 
     if (stageRef.current === 'down' && upFrameCountRef.current >= MIN_REP_FRAMES) {
@@ -294,14 +460,26 @@ export default function Home() {
       const bottomHip = bottomHipYRef.current ?? hipY
       const depthTravel = bottomHip - topHip
       const normalizedDepth = shoulderWidth > 0 ? depthTravel / shoulderWidth : 0
+      const elbowExcursion =
+        (cycleMaxElbowRef.current ?? smoothedElbow) - (cycleMinElbowRef.current ?? smoothedElbow)
+      const now = performance.now()
+      const downDurationMs = downStartedAtRef.current ? now - downStartedAtRef.current : 0
+      const cooldownPassed = now - lastRepAtRef.current >= REP_COOLDOWN_MS
+      const depthOk = normalizedDepth >= MIN_HIP_HEIGHT_DELTA
+      const excursionOk = elbowExcursion >= MIN_ELBOW_EXCURSION
+      const downHeldEnough = downDurationMs >= 80
 
-      if (normalizedDepth >= MIN_HIP_HEIGHT_DELTA) {
+      if (cooldownPassed && downHeldEnough && (depthOk || excursionOk)) {
         setRepCount((p) => p + 1)
+        lastRepAtRef.current = now
       }
 
       stageRef.current = 'up'
       topHipYRef.current = hipY
       bottomHipYRef.current = null
+      cycleMinElbowRef.current = smoothedElbow
+      cycleMaxElbowRef.current = smoothedElbow
+      downStartedAtRef.current = null
     }
 
     let score = 100
@@ -311,6 +489,17 @@ export default function Home() {
     if (bodyDeviation > 16) {
       score -= clamp((bodyDeviation - 16) * 1.7, 0, 35)
       nextFeedback.push('Keep a straighter plank line from shoulders to ankles.')
+    }
+
+    const hipDeviation = Math.abs(180 - side.hipAngle)
+    if (hipDeviation > 20) {
+      score -= clamp((hipDeviation - 20) * 1.3, 0, 20)
+      nextFeedback.push('Avoid piking or sagging at the hips.')
+    }
+
+    if (side.elbowTorsoAngle > 82) {
+      score -= clamp((side.elbowTorsoAngle - 82) * 1.1, 0, 18)
+      nextFeedback.push('Tuck elbows a bit closer to your torso.')
     }
 
     if (side.wristShoulderDx < 0.035) {
@@ -398,6 +587,36 @@ export default function Home() {
         radius: 4,
       })
       analyzePose(poses)
+
+      if (shareEnabled && roomId.trim() && relayOrigin.trim()) {
+        if (t - lastSharePushAtRef.current >= SHARE_PUSH_INTERVAL_MS) {
+          lastSharePushAtRef.current = t
+          const payload = {
+            deviceId: deviceIdRef.current,
+            updatedAt: Date.now(),
+            poseLandmarks: poses.map((lm) => ({
+              x: lm.x,
+              y: lm.y,
+              z: lm.z,
+              visibility: lm.visibility ?? 1,
+            })),
+            handLandmarks: (hResult.landmarks ?? []).map((hand) =>
+              hand.map((lm) => ({
+                x: lm.x,
+                y: lm.y,
+                z: lm.z,
+                visibility: 1,
+              })),
+            ),
+          }
+
+          void fetch(`${relayOrigin}/api/rooms/${encodeURIComponent(roomId.trim())}/landmarks`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+          })
+        }
+      }
     }
 
     if (hResult.landmarks && hResult.landmarks.length > 0) {
@@ -413,6 +632,25 @@ export default function Home() {
           lineWidth: 2,
           radius: 3,
         })
+      }
+    }
+
+    if (remoteFeedsRef.current.length > 0) {
+      const remoteDrawer = new DrawingUtils(ctx)
+      for (const feed of remoteFeedsRef.current) {
+        const remotePose = normalizeWireLandmarks(feed.poseLandmarks)
+        if (remotePose.length > 0) {
+          const color = roomColorFromId(feed.deviceId)
+          remoteDrawer.drawConnectors(remotePose, PoseLandmarker.POSE_CONNECTIONS, {
+            color,
+            lineWidth: 2,
+          })
+          remoteDrawer.drawLandmarks(remotePose, {
+            color,
+            lineWidth: 1,
+            radius: 2,
+          })
+        }
       }
     }
 
@@ -437,6 +675,11 @@ export default function Home() {
           topHipYRef.current = null
           elbowEmaRef.current = null
           bodyEmaRef.current = null
+          cycleMinElbowRef.current = null
+          cycleMaxElbowRef.current = null
+          upAngleBaselineRef.current = null
+          downStartedAtRef.current = null
+          lastRepAtRef.current = 0
           stageRef.current = 'up'
           setRepCount(0)
           setQualityScore(0)
@@ -481,6 +724,48 @@ export default function Home() {
              <p className="text-sm text-neutral-400">Hands</p>
              <p className="text-2xl font-bold">{handsDetected}</p>
           </div>
+          <div className="bg-neutral-800 p-4 rounded-lg">
+             <p className="text-sm text-neutral-400">Room peers</p>
+             <p className="text-2xl font-bold">{remoteFeeds.length}</p>
+          </div>
+        </div>
+
+        <div className="bg-neutral-800 p-4 rounded-lg space-y-3">
+          <h2 className="font-semibold">Local Network Room Relay</h2>
+          <p className="text-sm text-neutral-300">
+            Use the same room ID and relay URL on all devices in your LAN.
+          </p>
+          <div className="grid md:grid-cols-2 gap-3">
+            <label className="text-sm space-y-1 block">
+              <span className="text-neutral-300">Relay URL</span>
+              <input
+                value={relayOrigin}
+                onChange={(e) => setRelayOrigin(e.target.value)}
+                className="w-full rounded bg-neutral-900 border border-neutral-700 px-3 py-2"
+                placeholder="http://192.168.x.x:3000"
+              />
+            </label>
+            <label className="text-sm space-y-1 block">
+              <span className="text-neutral-300">Room ID</span>
+              <input
+                value={roomId}
+                onChange={(e) => setRoomId(e.target.value)}
+                className="w-full rounded bg-neutral-900 border border-neutral-700 px-3 py-2"
+                placeholder="pushup-lab"
+              />
+            </label>
+          </div>
+          <label className="inline-flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={shareEnabled}
+              onChange={(e) => setShareEnabled(e.target.checked)}
+            />
+            Enable room sharing webhook
+          </label>
+          <p className="text-xs text-neutral-400">
+            Device ID: {deviceIdRef.current}
+          </p>
         </div>
 
         <div className="flex gap-4 justify-center">
