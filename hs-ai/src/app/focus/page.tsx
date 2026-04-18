@@ -327,7 +327,9 @@ export default function FocusPage() {
               <CardContent className="space-y-3">
                 <Progress value={completionPercent} className="w-full gap-2">
                   <ProgressLabel>Completion</ProgressLabel>
-                  <ProgressValue>{completionPercent}%</ProgressValue>
+                  <ProgressValue>
+                    {(_, value) => `${value ?? completionPercent}%`}
+                  </ProgressValue>
                 </Progress>
                 <p className="text-sm text-muted-foreground">
                   Step {session.currentStepIndex + 1} of {session.steps.length}

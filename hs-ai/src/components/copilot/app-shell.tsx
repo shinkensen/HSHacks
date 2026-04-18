@@ -98,7 +98,7 @@ function AppSidebarLeft({
           <SidebarMenuItem>
             <div className="flex items-center gap-2 rounded-md bg-background/80 px-2 py-2">
               {isUserLoaded && userEmail ? (
-                <UserButton afterSignOutUrl="/" />
+                <UserButton />
               ) : (
                 <div className="size-7 shrink-0 rounded-full bg-muted" />
               )}
