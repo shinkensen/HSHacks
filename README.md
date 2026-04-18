@@ -19,22 +19,23 @@ MomentumAI’s AI system acts as a mentor, helping users break down complex or o
  MomentumAI improves wellbeing by combining social interaction, physical activity, and smart task guidance. Voice chat and friend leaderboards make self-improvement more engaging and collaborative. Exercise supports mental health by reducing stress, anxiety, and depression while boosting mood and focus. Completing tasks builds confidence, lowers stress, and reinforces motivation through a sense of accomplishment.
  
  ## Technical Stack
- - Frontend: Next.js 
- - Storage/Database: Convex and Upstash Redis
- - Authentication: Clerk 
- - Motion Recognition: Mediapipe 
- - AI Companion: GPT 5.4 Nano  
- - Voice Chat SDK: Agora 
+Frontend: Next.js  
+Storage/Database: Convex and Upstash Redis  
+Authentication: Clerk  
+Motion Recognition: Mediapipe  
+AI Companion: GPT 5.4 Nano  
+Voice Chat SDK: Agora  
 
- ## Features that we are proud of 
- Seamless LAN-based lobby creation and joining
- Real-time repetition tracking across users
- Reliable, low-latency voice communication
- Integrated AI-driven task assistance
+## Features that we are proud of
+Seamless LAN-based lobby creation and joining  
+Real-time repetition tracking across users  
+Reliable, low-latency voice communication  
+Integrated AI-driven task assistance  
 
  ## Some Problems we ran into
  One of the biggest challenges was implementing accurate motion detection. Integrating MediaPipe with our existing frontend required careful coordination to ensure real-time responsiveness and reliability. Achieving smooth, seamless interaction between the motion recognition system and the user interface was critical—and ultimately one of the most rewarding aspects of development. 
 
+<<<<<<< HEAD
 
 
 
@@ -43,3 +44,5 @@ MomentumAI’s AI system acts as a mentor, helping users break down complex or o
 
 
 >>>>>>> 04d923a (readme done)
+=======
+>>>>>>> 5ffc7b8 (third readme change)
