@@ -189,7 +189,7 @@ export default function InputPage() {
               <CardContent className="space-y-3">
                 <Progress value={readiness} className="w-full gap-2">
                   <ProgressLabel>Ready</ProgressLabel>
-                  <ProgressValue>{readiness}%</ProgressValue>
+                  <ProgressValue>{(_, value) => `${value ?? readiness}%`}</ProgressValue>
                 </Progress>
                 <p className="text-sm text-muted-foreground">
                   Add either a clear goal or image context. Add both for higher-quality steps.
