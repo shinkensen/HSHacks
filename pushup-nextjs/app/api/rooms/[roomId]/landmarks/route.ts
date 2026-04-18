@@ -9,6 +9,8 @@ type WireLandmark = {
 
 type DeviceFeed = {
   deviceId: string
+  username: string
+  reps: number
   updatedAt: number
   poseLandmarks: WireLandmark[]
   handLandmarks: WireLandmark[][]
@@ -19,6 +21,18 @@ type RoomStore = {
 }
 
 const STALE_MS = 12000
+const ROOM_ID_MAX = 64
+const DEVICE_ID_MAX = 80
+const USERNAME_MAX = 32
+
+const REDIS_REST_URL = process.env.UPSTASH_REDIS_REST_URL
+const REDIS_REST_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN
+const USE_UPSTASH = Boolean(REDIS_REST_URL && REDIS_REST_TOKEN)
+
+const HEADERS = {
+  Authorization: `Bearer ${REDIS_REST_TOKEN ?? ''}`,
+  'Content-Type': 'application/json',
+}
 
 const globalStore = globalThis as typeof globalThis & {
   __pushupRoomStore?: Map<string, RoomStore>
@@ -29,6 +43,80 @@ if (!globalStore.__pushupRoomStore) {
 }
 
 const rooms = globalStore.__pushupRoomStore
+
+function safeRoomId(roomId: string) {
+  return roomId.trim().slice(0, ROOM_ID_MAX)
+}
+
+function safeDeviceId(deviceId: string) {
+  return deviceId.trim().slice(0, DEVICE_ID_MAX)
+}
+
+function safeUsername(username: string | undefined) {
+  const fallback = 'Anonymous'
+  if (!username || typeof username !== 'string') return fallback
+  const trimmed = username.trim().slice(0, USERNAME_MAX)
+  return trimmed || fallback
+}
+
+function roomDataKey(roomId: string) {
+  return `pushup:room:${roomId}:devices`
+}
+
+function roomTouchedKey(roomId: string) {
+  return `pushup:room:${roomId}:touched`
+}
+
+async function redisCommand(args: Array<string | number>) {
+  if (!USE_UPSTASH) {
+    throw new Error('Upstash is not configured')
+  }
+
+  // Upstash /pipeline expects an array of Redis command arrays, e.g. [["GET", "key"]].
+  const res = await fetch(`${REDIS_REST_URL}/pipeline`, {
+    method: 'POST',
+    headers: HEADERS,
+    body: JSON.stringify([args]),
+    cache: 'no-store',
+  })
+
+  if (!res.ok) {
+    throw new Error(`Upstash request failed: ${res.status}`)
+  }
+
+  const payload = (await res.json()) as Array<{ result?: unknown; error?: string }>
+  const first = payload[0]
+  if (!first) {
+    return null
+  }
+  if (first.error) {
+    throw new Error(first.error)
+  }
+  return first.result ?? null
+}
+
+async function readFromUpstash(roomId: string) {
+  const raw = await redisCommand(['GET', roomDataKey(roomId)])
+  if (!raw || typeof raw !== 'string') {
+    return [] as DeviceFeed[]
+  }
+
+  let parsed: DeviceFeed[] = []
+  try {
+    parsed = JSON.parse(raw) as DeviceFeed[]
+  } catch {
+    parsed = []
+  }
+
+  const now = Date.now()
+  return parsed.filter((d) => now - d.updatedAt <= STALE_MS)
+}
+
+async function writeToUpstash(roomId: string, devices: DeviceFeed[]) {
+  const ttlSec = Math.max(30, Math.ceil((STALE_MS * 3) / 1000))
+  await redisCommand(['SET', roomDataKey(roomId), JSON.stringify(devices), 'EX', ttlSec])
+  await redisCommand(['SET', roomTouchedKey(roomId), Date.now(), 'EX', ttlSec])
+}
 
 function getRoom(roomId: string) {
   if (!rooms.has(roomId)) {
@@ -51,16 +139,28 @@ export async function GET(
   context: { params: Promise<{ roomId: string }> },
 ) {
   const { roomId } = await context.params
-  const safeRoomId = roomId.trim().slice(0, 64)
-  if (!safeRoomId) {
+  const normalizedRoomId = safeRoomId(roomId)
+  if (!normalizedRoomId) {
     return NextResponse.json({ error: 'Invalid room ID' }, { status: 400 })
   }
 
-  const room = getRoom(safeRoomId)
+  if (USE_UPSTASH) {
+    try {
+      const devices = await readFromUpstash(normalizedRoomId)
+      return NextResponse.json({ roomId: normalizedRoomId, devices })
+    } catch {
+      return NextResponse.json(
+        { error: 'Cloud relay failed. Verify Upstash credentials.' },
+        { status: 502 },
+      )
+    }
+  }
+
+  const room = getRoom(normalizedRoomId)
   pruneRoom(room)
 
   return NextResponse.json({
-    roomId: safeRoomId,
+    roomId: normalizedRoomId,
     devices: Array.from(room.devices.values()),
   })
 }
@@ -70,8 +170,8 @@ export async function POST(
   context: { params: Promise<{ roomId: string }> },
 ) {
   const { roomId } = await context.params
-  const safeRoomId = roomId.trim().slice(0, 64)
-  if (!safeRoomId) {
+  const normalizedRoomId = safeRoomId(roomId)
+  if (!normalizedRoomId) {
     return NextResponse.json({ error: 'Invalid room ID' }, { status: 400 })
   }
 
@@ -86,16 +186,50 @@ export async function POST(
     return NextResponse.json({ error: 'deviceId is required' }, { status: 400 })
   }
 
-  const room = getRoom(safeRoomId)
-  pruneRoom(room)
-
-  const deviceId = body.deviceId.trim().slice(0, 80)
-  room.devices.set(deviceId, {
-    deviceId,
+  const normalizedDeviceId = safeDeviceId(body.deviceId)
+  const normalizedUsername = safeUsername((body as DeviceFeed).username)
+  const normalizedReps = Number.isFinite((body as DeviceFeed).reps)
+    ? Math.max(0, Math.floor((body as DeviceFeed).reps))
+    : 0
+  const nextFeed: DeviceFeed = {
+    deviceId: normalizedDeviceId,
+    username: normalizedUsername,
+    reps: normalizedReps,
     updatedAt: Date.now(),
     poseLandmarks: Array.isArray(body.poseLandmarks) ? body.poseLandmarks : [],
     handLandmarks: Array.isArray(body.handLandmarks) ? body.handLandmarks : [],
+  }
+
+  if (USE_UPSTASH) {
+    try {
+      const current = await readFromUpstash(normalizedRoomId)
+      const existing = current.find((d) => d.deviceId === normalizedDeviceId)
+      const mergedFeed: DeviceFeed = {
+        ...nextFeed,
+        reps: Math.max(existing?.reps ?? 0, nextFeed.reps),
+        username: nextFeed.username || existing?.username || 'Anonymous',
+      }
+      const withoutCurrent = current.filter((d) => d.deviceId !== normalizedDeviceId)
+      withoutCurrent.push(mergedFeed)
+      await writeToUpstash(normalizedRoomId, withoutCurrent)
+      return NextResponse.json({ ok: true, relay: 'upstash' })
+    } catch {
+      return NextResponse.json(
+        { error: 'Cloud relay failed. Verify Upstash credentials.' },
+        { status: 502 },
+      )
+    }
+  }
+
+  const room = getRoom(normalizedRoomId)
+  pruneRoom(room)
+
+  const existing = room.devices.get(normalizedDeviceId)
+  room.devices.set(normalizedDeviceId, {
+    ...nextFeed,
+    reps: Math.max(existing?.reps ?? 0, nextFeed.reps),
+    username: nextFeed.username || existing?.username || 'Anonymous',
   })
 
-  return NextResponse.json({ ok: true })
+  return NextResponse.json({ ok: true, relay: 'memory' })
 }
