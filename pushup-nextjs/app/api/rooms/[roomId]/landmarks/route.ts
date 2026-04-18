@@ -57,18 +57,16 @@ function roomTouchedKey(roomId: string) {
   return `pushup:room:${roomId}:touched`
 }
 
-async function redisCommand(args: Array<string | number | object>) {
+async function redisCommand(args: Array<string | number>) {
   if (!USE_UPSTASH) {
     throw new Error('Upstash is not configured')
   }
+
+  // Upstash /pipeline expects an array of Redis command arrays, e.g. [["GET", "key"]].
   const res = await fetch(`${REDIS_REST_URL}/pipeline`, {
     method: 'POST',
     headers: HEADERS,
-    body: JSON.stringify([
-      {
-        command: args,
-      },
-    ]),
+    body: JSON.stringify([args]),
     cache: 'no-store',
   })
 
