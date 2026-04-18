@@ -16,8 +16,53 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "HS AI Copilot",
-  description: "ADHD next-step copilot with Clerk, Convex, and AI Gateway.",
+  metadataBase: new URL("https://hschacks.dev7.xyz"),
+  title: {
+    default: "momentum.ai",
+    template: "%s | momentum.ai",
+  },
+  applicationName: "momentum.ai",
+  description:
+    "momentum.ai helps you keep momentum with focused sessions, workout tracking, and real-time coaching.",
+  keywords: [
+    "momentum.ai",
+    "focus app",
+    "productivity",
+    "pushup coach",
+    "crunch coach",
+    "habit tracking",
+  ],
+  openGraph: {
+    title: "momentum.ai",
+    description:
+      "Keep momentum with focused sessions and real-time workout coaching.",
+    type: "website",
+    url: "/",
+    siteName: "momentum.ai",
+    images: [
+      {
+        url: "/logo.png",
+        width: 742,
+        height: 635,
+        alt: "momentum.ai logo",
+      },
+    ],
+  },
+  twitter: {
+    card: "summary_large_image",
+    title: "momentum.ai",
+    description:
+      "Keep momentum with focused sessions and real-time workout coaching.",
+    images: ["/logo.png"],
+  },
+  icons: {
+    icon: [
+      { url: "/logo.svg", type: "image/svg+xml" },
+      { url: "/logo.png", type: "image/png" },
+    ],
+    shortcut: ["/logo.svg"],
+    apple: [{ url: "/logo.png", type: "image/png" }],
+  },
 };
 
 export default function RootLayout({

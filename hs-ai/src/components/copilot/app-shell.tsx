@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { UserButton, useAuth, useUser } from "@clerk/nextjs";
 import { useQuery } from "convex/react";
+import Image from "next/image";
 import { usePathname, useRouter } from "next/navigation";
 
 import { api } from "@/lib/convex-api";
@@ -110,6 +111,7 @@ function AppSidebarLeft({
 
   const navItems = [
     { label: "Pushup Coach", href: "/pushups" },
+    { label: "Crunch Coach", href: "/crunches" },
     { label: "Goal Input", href: "/input" },
     { label: "Focus", href: "/focus" },
     { label: "Summary", href: "/summary" },
@@ -118,6 +120,21 @@ function AppSidebarLeft({
   return (
     <Sidebar className="h-svh border-r">
       <SidebarHeader>
+        <button
+          type="button"
+          onClick={() => router.push("/pushups")}
+          className="mb-1 flex items-center gap-2 rounded-md px-2 py-1 text-left hover:bg-muted/40"
+        >
+          <Image
+            src="/logo.svg"
+            alt="momentum.ai logo"
+            width={20}
+            height={20}
+            className="size-5 rounded-sm"
+            priority
+          />
+          <span className="text-sm font-semibold tracking-tight">momentum.ai</span>
+        </button>
         <SidebarMenu>
           <SidebarMenuItem>
             <div className="flex items-center gap-2 rounded-md bg-background/80 px-2 py-2">
@@ -198,6 +215,11 @@ function AppSidebarLeft({
             </SidebarMenuButton>
           </SidebarMenuItem>
           <SidebarMenuItem>
+            <SidebarMenuButton onClick={() => router.push("/crunches")}>
+              Open crunch coach
+            </SidebarMenuButton>
+          </SidebarMenuItem>
+          <SidebarMenuItem>
             <SidebarMenuButton onClick={() => router.push("/input")}>
               Start new session
             </SidebarMenuButton>
@@ -222,7 +244,7 @@ function InsightsSidebarBody({
   streak,
   calendarDays,
 }: {
-  mode: "copilot" | "pushups";
+  mode: "copilot" | "pushups" | "crunches";
   selectedDate: Date | undefined;
   onSelectedDateChange: (date: Date | undefined) => void;
   selectedDayHistory: HistoryItem[];
@@ -240,6 +262,8 @@ function InsightsSidebarBody({
     [calendarDays],
   );
   const router = useRouter();
+  const isWorkoutMode = mode !== "copilot";
+  const workoutHref = mode === "crunches" ? "/crunches" : "/pushups";
 
   return (
     <>
@@ -280,7 +304,7 @@ function InsightsSidebarBody({
         <SidebarGroup className="px-0 sm:px-1">
           <SidebarGroupLabel className="px-2">Selected Day</SidebarGroupLabel>
           <SidebarGroupContent className="grid grid-cols-2 gap-x-2 gap-y-1 px-2 text-[11px] leading-snug sm:px-3 sm:text-xs sm:leading-normal">
-            {mode === "pushups" ? (
+            {isWorkoutMode ? (
               <>
                 <p className="col-span-2 text-muted-foreground">Workouts</p>
                 <p className="col-span-2 font-medium tabular-nums text-foreground">
@@ -305,7 +329,7 @@ function InsightsSidebarBody({
         <SidebarGroup className="px-0 sm:px-1">
           <SidebarGroupLabel className="px-2">Last 7 Days</SidebarGroupLabel>
           <SidebarGroupContent className="grid grid-cols-2 gap-x-2 gap-y-1 px-2 text-[11px] leading-snug sm:px-3 sm:text-xs sm:leading-normal">
-            {mode === "pushups" ? (
+            {isWorkoutMode ? (
               <>
                 <p className="col-span-2 text-muted-foreground">Workouts</p>
                 <p className="col-span-2 font-medium tabular-nums">
@@ -358,7 +382,7 @@ function InsightsSidebarBody({
         )}
         <SidebarGroup className="px-1">
           <SidebarGroupLabel className="px-2">
-            {mode === "pushups" ? (
+            {isWorkoutMode ? (
               <span className="flex flex-col gap-0.5 normal-case">
                 <span>Workouts</span>
                 <span className="text-[11px] font-normal text-muted-foreground">
@@ -377,27 +401,27 @@ function InsightsSidebarBody({
           <SidebarGroupContent className="px-2">
             <SidebarMenu
               className={
-                mode === "pushups"
+                isWorkoutMode
                   ? "max-h-[min(12rem,36vh)] gap-0.5 overflow-y-auto overscroll-contain"
                   : undefined
               }
             >
-              {(mode === "pushups"
+              {(isWorkoutMode
                 ? selectedPushupSessions.length === 0
                 : selectedDayHistory.length === 0) ? (
                 <SidebarMenuItem>
                   <SidebarMenuButton disabled>
-                    {mode === "pushups"
+                    {isWorkoutMode
                       ? "No reps logged this day"
                       : "No entries on selected day"}
                   </SidebarMenuButton>
                 </SidebarMenuItem>
               ) : (
-                mode === "pushups" ? (
+                isWorkoutMode ? (
                   selectedPushupSessions.map((entry) => (
                     <SidebarMenuItem key={entry._id}>
                       <SidebarMenuButton
-                        onClick={() => router.push("/pushups")}
+                        onClick={() => router.push(workoutHref)}
                         className="h-auto min-h-0 px-2.5 py-1.5 text-left"
                       >
                         <div className="flex w-full flex-col gap-0.5">
@@ -497,6 +521,8 @@ export function CopilotAppShell({
   const { user, isLoaded: isUserLoaded } = useUser();
   const pathname = usePathname();
   const isPushupsMode = pathname.startsWith("/pushups");
+  const isCrunchesMode = pathname.startsWith("/crunches");
+  const isWorkoutMode = isPushupsMode || isCrunchesMode;
   const [insightsSheetOpen, setInsightsSheetOpen] = useState(false);
   const [selectedDate, setSelectedDate] = useState<Date | undefined>(new Date());
   const [pushupInsights, setPushupInsights] = useState<{
@@ -509,7 +535,7 @@ export function CopilotAppShell({
 
   const insights = useQuery(
     api.sessions.getDashboardInsights,
-    isLoaded && userId && !isPushupsMode
+    isLoaded && userId && !isWorkoutMode
       ? { selectedDayTs: (selectedDate ?? new Date()).getTime() }
       : "skip",
   );
@@ -517,17 +543,17 @@ export function CopilotAppShell({
   useEffect(() => {
     let cancelled = false;
     async function loadPushupInsights() {
-      if (!isLoaded || !userId || !isPushupsMode) {
+      if (!isLoaded || !userId || !isWorkoutMode) {
         return;
       }
       try {
         const selectedDayTs = (selectedDate ?? new Date()).getTime();
         const selectedDayKey = toLocalDayKey(selectedDate ?? new Date());
         const currentDayKey = toLocalDayKey(new Date());
-        const response = await fetch(
-          `/api/pushups/calendar?selectedDayTs=${selectedDayTs}&selectedDayKey=${encodeURIComponent(selectedDayKey)}&currentDayKey=${encodeURIComponent(currentDayKey)}`,
-          { cache: "no-store" },
-        );
+        const endpoint = isCrunchesMode
+          ? `/api/crunches/calendar?selectedDayTs=${selectedDayTs}&selectedDayKey=${encodeURIComponent(selectedDayKey)}&currentDayKey=${encodeURIComponent(currentDayKey)}`
+          : `/api/pushups/calendar?selectedDayTs=${selectedDayTs}&selectedDayKey=${encodeURIComponent(selectedDayKey)}&currentDayKey=${encodeURIComponent(currentDayKey)}`;
+        const response = await fetch(endpoint, { cache: "no-store" });
         if (!response.ok || cancelled) return;
         const payload = (await response.json()) as {
           selectedDaySessions: PushupSessionItem[];
@@ -549,7 +575,7 @@ export function CopilotAppShell({
     return () => {
       cancelled = true;
     };
-  }, [isLoaded, isPushupsMode, selectedDate, userId]);
+  }, [isCrunchesMode, isLoaded, isWorkoutMode, selectedDate, userId]);
 
   const history = useMemo(
     () => (insights?.recentHistory ?? []) as HistoryItem[],
@@ -557,7 +583,7 @@ export function CopilotAppShell({
   );
   const selectedDayHistory = useMemo(() => {
     if (!selectedDate) return [];
-    if (isPushupsMode) return [];
+    if (isWorkoutMode) return [];
     const selectedStart = startOfDay(selectedDate.getTime());
     const selectedEnd = selectedStart + 24 * 60 * 60 * 1000;
     return history.filter(
@@ -565,7 +591,7 @@ export function CopilotAppShell({
         entry.sessionCompletedAt >= selectedStart &&
         entry.sessionCompletedAt < selectedEnd,
     );
-  }, [history, isPushupsMode, selectedDate]);
+  }, [history, isWorkoutMode, selectedDate]);
 
   const selectedDaySummary = useMemo(
     () =>
@@ -586,7 +612,7 @@ export function CopilotAppShell({
   }, [pushupInsights?.selectedDaySessions]);
 
   const selectedPushupSummary = useMemo((): PushupStats => {
-    if (!isPushupsMode) {
+    if (!isWorkoutMode) {
       return {
         workouts: 0,
         totalReps: 0,
@@ -595,7 +621,7 @@ export function CopilotAppShell({
       };
     }
     return reducePushupDayStats(selectedPushupSessions);
-  }, [isPushupsMode, selectedPushupSessions]);
+  }, [isWorkoutMode, selectedPushupSessions]);
 
   const weeklyPushups = pushupInsights?.weeklyStats ?? {
     workouts: 0,
@@ -610,7 +636,7 @@ export function CopilotAppShell({
     stepsCompleted: 0,
     focusMinutes: 0,
   };
-  const streak = isPushupsMode
+  const streak = isWorkoutMode
     ? pushupInsights?.streak ?? {
         current: 0,
         longest: 0,
@@ -621,7 +647,7 @@ export function CopilotAppShell({
         longest: 0,
         lastActiveDayKey: null,
       };
-  const calendarDays = isPushupsMode
+  const calendarDays = isWorkoutMode
     ? pushupInsights?.calendarDays ?? []
     : insights?.calendarDays ?? [];
   const userName = user?.fullName ?? user?.username ?? "Signed in";
@@ -660,7 +686,7 @@ export function CopilotAppShell({
         </div>
       </SidebarInset>
       <AppSidebarRight
-        mode={isPushupsMode ? "pushups" : "copilot"}
+        mode={isPushupsMode ? "pushups" : isCrunchesMode ? "crunches" : "copilot"}
         mobileOpen={insightsSheetOpen}
         onMobileOpenChange={setInsightsSheetOpen}
         selectedDate={selectedDate}

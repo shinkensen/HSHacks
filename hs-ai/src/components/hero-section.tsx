@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 
+import { ThreeHeartLogo } from "@/components/three-heart-logo";
 import { buttonVariants } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
@@ -9,7 +10,8 @@ export default function HeroSection() {
   return (
     <section className="border-b border-border/60">
       <div className="mx-auto flex w-full max-w-5xl flex-col items-center px-6 py-18 text-center sm:px-8 sm:py-24">
-        <h1 className="mt-5 max-w-4xl text-balance text-4xl font-medium tracking-tight text-foreground sm:text-6xl">
+        <ThreeHeartLogo className="mb-1 sm:mb-2" />
+        <h1 className="mt-0 max-w-4xl text-balance text-4xl font-medium tracking-tight text-foreground sm:text-6xl">
           One tiny step at a time.
           <span className="block text-primary">No planning spiral.</span>
         </h1>

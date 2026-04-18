@@ -111,4 +111,60 @@ export default defineSchema({
       "deviceId",
       "updatedAt",
     ]),
+  crunchRoomDevices: defineTable({
+    roomId: v.string(),
+    deviceId: v.string(),
+    username: v.string(),
+    reps: v.number(),
+    updatedAt: v.number(),
+    poseLandmarks: v.array(wireLandmarkValidator),
+    handLandmarks: v.array(v.array(wireLandmarkValidator)),
+  })
+    .index("by_roomId_and_updatedAt", ["roomId", "updatedAt"])
+    .index("by_roomId_and_deviceId", ["roomId", "deviceId"]),
+  crunchSignals: defineTable({
+    roomId: v.string(),
+    signalId: v.number(),
+    fromDeviceId: v.string(),
+    toDeviceId: v.union(v.string(), v.null()),
+    type: v.union(
+      v.literal("join"),
+      v.literal("leave"),
+      v.literal("offer"),
+      v.literal("answer"),
+      v.literal("ice"),
+    ),
+    payloadJson: v.union(v.string(), v.null()),
+    createdAt: v.number(),
+  })
+    .index("by_roomId_and_signalId", ["roomId", "signalId"])
+    .index("by_roomId_and_createdAt", ["roomId", "createdAt"]),
+  crunchRoomLeaderboard: defineTable({
+    roomId: v.string(),
+    userId: v.string(),
+    username: v.string(),
+    bestReps: v.number(),
+    currentReps: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_roomId_and_bestReps", ["roomId", "bestReps"])
+    .index("by_roomId_and_userId", ["roomId", "userId"]),
+  crunchSessions: defineTable({
+    userId: v.string(),
+    roomId: v.string(),
+    deviceId: v.string(),
+    username: v.string(),
+    startedAt: v.number(),
+    endedAt: v.union(v.number(), v.null()),
+    maxReps: v.number(),
+    caloriesEstimate: v.number(),
+    updatedAt: v.number(),
+    dayKey: v.string(),
+  })
+    .index("by_userId_and_dayKey", ["userId", "dayKey"])
+    .index("by_roomId_and_deviceId_and_updatedAt", [
+      "roomId",
+      "deviceId",
+      "updatedAt",
+    ]),
 });

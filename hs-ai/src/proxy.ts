@@ -3,11 +3,14 @@ import { NextResponse } from "next/server";
 
 const isProtectedRoute = createRouteMatcher([
   "/pushups(.*)",
+  "/crunches(.*)",
   "/input(.*)",
   "/focus(.*)",
   "/summary(.*)",
   "/api/rooms(.*)",
+  "/api/crunch-rooms(.*)",
   "/api/pushups(.*)",
+  "/api/crunches(.*)",
   "/api/steps(.*)",
 ]);
 

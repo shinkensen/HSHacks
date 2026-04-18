@@ -8,6 +8,7 @@
  * @module
  */
 
+import type * as crunchRooms from "../crunchRooms.js";
 import type * as pushupRooms from "../pushupRooms.js";
 import type * as sessions from "../sessions.js";
 
@@ -18,6 +19,7 @@ import type {
 } from "convex/server";
 
 declare const fullApi: ApiFromModules<{
+  crunchRooms: typeof crunchRooms;
   pushupRooms: typeof pushupRooms;
   sessions: typeof sessions;
 }>;
