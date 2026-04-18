@@ -1,6 +1,12 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import { useUser } from "@clerk/nextjs";
 import {
   DrawingUtils,
@@ -128,9 +134,26 @@ function writeRoomBestReps(roomId: string, reps: number) {
     const next = Math.max(map[id] ?? 0, reps);
     map[id] = next;
     localStorage.setItem(ROOM_BEST_REPS_KEY, JSON.stringify(map));
+    window.dispatchEvent(new Event("pushup-room-best-reps"));
   } catch {
     // ignore quota / private mode
   }
+}
+
+function subscribeRoomBestReps(listener: () => void) {
+  if (typeof window === "undefined") {
+    return () => {};
+  }
+  const onStorage = (e: StorageEvent) => {
+    if (e.key === ROOM_BEST_REPS_KEY || e.key === null) listener();
+  };
+  const onCustom = () => listener();
+  window.addEventListener("storage", onStorage);
+  window.addEventListener("pushup-room-best-reps", onCustom);
+  return () => {
+    window.removeEventListener("storage", onStorage);
+    window.removeEventListener("pushup-room-best-reps", onCustom);
+  };
 }
 
 const SHOULDER_L = 11;
@@ -292,7 +315,6 @@ export function PushupCoach() {
   const [roomLeaderboard, setRoomLeaderboard] = useState<
     RoomLeaderboardEntry[]
   >([]);
-  const [persistedRoomBestReps, setPersistedRoomBestReps] = useState(0);
   const [remoteMediaFeeds, setRemoteMediaFeeds] = useState<RemoteMediaFeed[]>(
     [],
   );
@@ -398,6 +420,17 @@ export function PushupCoach() {
     };
   }
 
+  const normalizedRoomIdForBest = useMemo(
+    () => normalizeRoomId(roomId),
+    [roomId],
+  );
+
+  const storedRoomBestReps = useSyncExternalStore(
+    subscribeRoomBestReps,
+    () => readRoomBestReps(normalizedRoomIdForBest),
+    () => 0,
+  );
+
   async function pushRoomPresence() {
     const normalizedRoomId = normalizeRoomId(roomId);
     if (!shareEnabled || !normalizedRoomId) return;
@@ -426,7 +459,7 @@ export function PushupCoach() {
             deviceId: entry.userId,
             username: entry.username,
             reps: isSelf
-              ? Math.max(entry.reps, repCount, persistedRoomBestReps)
+              ? Math.max(entry.reps, repCount, storedRoomBestReps)
               : entry.reps,
             isSelf,
           };
@@ -435,7 +468,7 @@ export function PushupCoach() {
         .slice(0, 10);
     }
 
-    const selfReps = Math.max(repCount, persistedRoomBestReps);
+    const selfReps = Math.max(repCount, storedRoomBestReps);
     return [
       {
         deviceId: ensureDeviceId(),
@@ -454,7 +487,7 @@ export function PushupCoach() {
       .slice(0, 10);
   }, [
     profileUsername,
-    persistedRoomBestReps,
+    storedRoomBestReps,
     remoteFeeds,
     repCount,
     roomLeaderboard,
@@ -463,15 +496,8 @@ export function PushupCoach() {
 
   useEffect(() => {
     const id = normalizeRoomId(roomId);
-    if (!id || typeof window === "undefined") return;
-    setPersistedRoomBestReps(readRoomBestReps(id));
-  }, [roomId]);
-
-  useEffect(() => {
-    const id = normalizeRoomId(roomId);
     if (!id || repCount <= 0) return;
     writeRoomBestReps(id, repCount);
-    setPersistedRoomBestReps((prev) => Math.max(prev, repCount));
   }, [repCount, roomId]);
 
   useEffect(() => {
@@ -481,7 +507,6 @@ export function PushupCoach() {
     const id = normalizeRoomId(roomId);
     if (!id) return;
     writeRoomBestReps(id, row.reps);
-    setPersistedRoomBestReps((prev) => Math.max(prev, row.reps));
   }, [roomLeaderboard, profileUsername, username, roomId]);
 
   const calorieEstimate = useMemo(() => {

@@ -1,5 +1,3 @@
-import Link from "next/link";
-
 const FOOTER_LINKS = [
   { label: "Features", href: "/#features" },
   { label: "Flow", href: "/#how-it-works" },
