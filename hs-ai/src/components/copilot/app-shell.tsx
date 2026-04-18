@@ -397,13 +397,12 @@ function InsightsSidebarBody({
                 value={heatMapValues}
                 startDate={heatMapStartDate}
                 endDate={heatMapEndDate}
-                rectSize={6}
-                space={1}
-                width={234}
+                rectSize={8}
+                space={2}
                 legendCellSize={0}
                 weekLabels={["", "", "", "", "", "", ""]}
                 panelColors={["#edf4ee", "#cfe4d2", "#98ca9f", "#57a468", "#1f6b39"]}
-                style={{ color: "#2f6f3d" }}
+                style={{ color: "#2f6f3d", width: "100%", display: "block" }}
               />
             </div>
             <p className="px-1 pt-1 text-[11px] text-muted-foreground">
