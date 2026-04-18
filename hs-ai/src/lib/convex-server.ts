@@ -2,12 +2,16 @@ import { ConvexHttpClient } from "convex/browser";
 
 let cachedClient: ConvexHttpClient | null = null;
 
+function normalizeConvexUrl(url: string): string {
+  return url.replace(/\/+$/, "");
+}
+
 function readConvexUrl(): string {
   const url = process.env.NEXT_PUBLIC_CONVEX_URL ?? process.env.CONVEX_URL;
   if (!url) {
     throw new Error("Convex URL missing. Set NEXT_PUBLIC_CONVEX_URL or CONVEX_URL.");
   }
-  return url;
+  return normalizeConvexUrl(url);
 }
 
 function getClient(): ConvexHttpClient {
