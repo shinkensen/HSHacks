@@ -53,6 +53,16 @@ export async function GET(request: Request) {
   const selectedDayTs = Number.isFinite(selectedDayTsRaw)
     ? selectedDayTsRaw
     : Date.now();
+  const selectedDayKeyRaw = url.searchParams.get("selectedDayKey");
+  const currentDayKeyRaw = url.searchParams.get("currentDayKey");
+  const selectedDayKey =
+    selectedDayKeyRaw && /^\d{4}-\d{2}-\d{2}$/.test(selectedDayKeyRaw)
+      ? selectedDayKeyRaw
+      : null;
+  const currentDayKey =
+    currentDayKeyRaw && /^\d{4}-\d{2}-\d{2}$/.test(currentDayKeyRaw)
+      ? currentDayKeyRaw
+      : null;
 
   try {
     const insights = await queryConvex<CalendarResponse>(
@@ -60,6 +70,8 @@ export async function GET(request: Request) {
       {
         userId,
         selectedDayTs,
+        selectedDayKey,
+        currentDayKey,
       },
     );
 

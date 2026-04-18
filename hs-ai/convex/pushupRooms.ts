@@ -61,6 +61,19 @@ function dayKeyFromTimestamp(timestamp: number): string {
   return new Date(timestamp).toISOString().slice(0, 10);
 }
 
+function normalizeDayKey(dayKey: string | null | undefined): string | null {
+  if (!dayKey) return null;
+  const trimmed = dayKey.trim();
+  return /^\d{4}-\d{2}-\d{2}$/.test(trimmed) ? trimmed : null;
+}
+
+function shiftDayKey(dayKey: string, deltaDays: number): string {
+  const base = new Date(`${dayKey}T00:00:00.000Z`).getTime();
+  return new Date(base + deltaDays * 24 * 60 * 60 * 1000)
+    .toISOString()
+    .slice(0, 10);
+}
+
 function caloriesFromReps(reps: number): number {
   return Number((Math.max(0, reps) * CALORIES_PER_REP).toFixed(1));
 }
@@ -319,6 +332,7 @@ export const startSession = mutation({
     userId: v.string(),
     username: v.string(),
     initialReps: v.number(),
+    dayKey: v.union(v.string(), v.null()),
   },
   handler: async (ctx, args) => {
     const roomId = normalizeRoomId(args.roomId);
@@ -331,6 +345,7 @@ export const startSession = mutation({
     const now = Date.now();
     const initialReps = clamp(Math.floor(args.initialReps), 0, MAX_REPS);
     const username = normalizeUsername(args.username);
+    const dayKey = normalizeDayKey(args.dayKey) ?? dayKeyFromTimestamp(now);
 
     const recentSessions = await ctx.db
       .query("pushupSessions")
@@ -349,7 +364,7 @@ export const startSession = mutation({
         maxReps: Math.max(openSession.maxReps, initialReps),
         caloriesEstimate: caloriesFromReps(Math.max(openSession.maxReps, initialReps)),
         updatedAt: now,
-        dayKey: dayKeyFromTimestamp(now),
+        dayKey,
       });
       return { ok: true, sessionId: openSession._id };
     }
@@ -364,7 +379,7 @@ export const startSession = mutation({
       maxReps: initialReps,
       caloriesEstimate: caloriesFromReps(initialReps),
       updatedAt: now,
-      dayKey: dayKeyFromTimestamp(now),
+      dayKey,
     });
     return { ok: true, sessionId };
   },
@@ -377,6 +392,7 @@ export const endSession = mutation({
     userId: v.string(),
     username: v.string(),
     finalReps: v.number(),
+    dayKey: v.union(v.string(), v.null()),
   },
   handler: async (ctx, args) => {
     const roomId = normalizeRoomId(args.roomId);
@@ -389,6 +405,7 @@ export const endSession = mutation({
     const now = Date.now();
     const finalReps = clamp(Math.floor(args.finalReps), 0, MAX_REPS);
     const username = normalizeUsername(args.username);
+    const dayKey = normalizeDayKey(args.dayKey) ?? dayKeyFromTimestamp(now);
 
     const recentSessions = await ctx.db
       .query("pushupSessions")
@@ -410,7 +427,7 @@ export const endSession = mutation({
         caloriesEstimate: caloriesFromReps(maxReps),
         updatedAt: now,
         endedAt: now,
-        dayKey: dayKeyFromTimestamp(now),
+        dayKey,
       });
       return { ok: true, sessionId: openSession._id };
     }
@@ -425,7 +442,7 @@ export const endSession = mutation({
       maxReps: finalReps,
       caloriesEstimate: caloriesFromReps(finalReps),
       updatedAt: now,
-      dayKey: dayKeyFromTimestamp(now),
+      dayKey,
     });
     return { ok: true, sessionId };
   },
@@ -435,6 +452,8 @@ export const getCalendarInsights = query({
   args: {
     userId: v.string(),
     selectedDayTs: v.number(),
+    selectedDayKey: v.union(v.string(), v.null()),
+    currentDayKey: v.union(v.string(), v.null()),
   },
   handler: async (ctx, args) => {
     const userId = normalizeUserId(args.userId);
@@ -445,7 +464,8 @@ export const getCalendarInsights = query({
     const selectedTs = Number.isFinite(args.selectedDayTs)
       ? args.selectedDayTs
       : Date.now();
-    const selectedDayKey = dayKeyFromTimestamp(selectedTs);
+    const selectedDayKey =
+      normalizeDayKey(args.selectedDayKey) ?? dayKeyFromTimestamp(selectedTs);
 
     const selectedDaySessionsRaw = await ctx.db
       .query("pushupSessions")
@@ -461,10 +481,8 @@ export const getCalendarInsights = query({
       .slice(0, MAX_WORKOUTS_IN_DAY_LIST);
 
     const now = Date.now();
-    const weekStart = new Date(selectedTs);
-    weekStart.setDate(weekStart.getDate() - 6);
-    const weekStartKey = dayKeyFromTimestamp(weekStart.getTime());
-    const todayKey = dayKeyFromTimestamp(now);
+    const weekStartKey = shiftDayKey(selectedDayKey, -6);
+    const todayKey = normalizeDayKey(args.currentDayKey) ?? dayKeyFromTimestamp(now);
 
     const weeklySessionsRaw = await ctx.db
       .query("pushupSessions")
@@ -478,9 +496,7 @@ export const getCalendarInsights = query({
 
     const weeklySessions = weeklySessionsRaw.filter(isCountedWorkoutSession);
 
-    const recentWindowStart = new Date(now);
-    recentWindowStart.setDate(recentWindowStart.getDate() - 180);
-    const recentWindowKey = dayKeyFromTimestamp(recentWindowStart.getTime());
+    const recentWindowKey = shiftDayKey(todayKey, -180);
     const recentSessions = await ctx.db
       .query("pushupSessions")
       .withIndex("by_userId_and_dayKey", (q) =>
@@ -523,13 +539,13 @@ export const getCalendarInsights = query({
       }
       longestStreak = Math.max(longestStreak, run);
 
-      const today = dayKeyFromTimestamp(now);
-      const yesterday = dayKeyFromTimestamp(now - 24 * 60 * 60 * 1000);
+      const today = todayKey;
+      const yesterday = shiftDayKey(todayKey, -1);
       const active = new Set(dayKeys);
       const anchor = active.has(today) ? today : active.has(yesterday) ? yesterday : null;
       if (anchor) {
         let cursor = new Date(`${anchor}T00:00:00.000Z`).getTime();
-        while (active.has(dayKeyFromTimestamp(cursor))) {
+        while (active.has(new Date(cursor).toISOString().slice(0, 10))) {
           currentStreak += 1;
           cursor -= 24 * 60 * 60 * 1000;
         }

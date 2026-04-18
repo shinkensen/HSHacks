@@ -165,6 +165,12 @@ export async function POST(
   );
   const finalRepsRaw = Number(source.finalReps);
   const finalReps = Number.isFinite(finalRepsRaw) ? finalRepsRaw : 0;
+  const clientDayKeyRaw =
+    typeof source.clientDayKey === "string" ? source.clientDayKey : null;
+  const clientDayKey =
+    clientDayKeyRaw && /^\d{4}-\d{2}-\d{2}$/.test(clientDayKeyRaw)
+      ? clientDayKeyRaw
+      : null;
 
   let payloadJson: string | null = null;
   if (source.payload !== undefined) {
@@ -205,6 +211,7 @@ export async function POST(
             userId,
             username,
             finalReps,
+            dayKey: clientDayKey,
           });
         } catch {}
       }
@@ -217,6 +224,7 @@ export async function POST(
           userId,
           username,
           initialReps: finalReps,
+          dayKey: clientDayKey,
         });
       } catch {}
     }
