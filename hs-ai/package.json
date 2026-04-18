@@ -16,6 +16,10 @@
     "@mediapipe/tasks-vision": "^0.10.34",
     "@shivantra/react-web-camera": "^1.1.0",
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+    "@uiw/react-heat-map": "^2.3.3",
+>>>>>>> 646d744 (type shit)
     "agora-access-token": "^2.0.4",
 =======
     "@uiw/react-heat-map": "^2.3.3",
