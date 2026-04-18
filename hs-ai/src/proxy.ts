@@ -7,6 +7,7 @@ const isProtectedRoute = createRouteMatcher([
   "/focus(.*)",
   "/summary(.*)",
   "/api/rooms(.*)",
+  "/api/pushups(.*)",
   "/api/steps(.*)",
 ]);
 

@@ -83,4 +83,32 @@ export default defineSchema({
   })
     .index("by_roomId_and_signalId", ["roomId", "signalId"])
     .index("by_roomId_and_createdAt", ["roomId", "createdAt"]),
+  pushupRoomLeaderboard: defineTable({
+    roomId: v.string(),
+    userId: v.string(),
+    username: v.string(),
+    bestReps: v.number(),
+    currentReps: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_roomId_and_bestReps", ["roomId", "bestReps"])
+    .index("by_roomId_and_userId", ["roomId", "userId"]),
+  pushupSessions: defineTable({
+    userId: v.string(),
+    roomId: v.string(),
+    deviceId: v.string(),
+    username: v.string(),
+    startedAt: v.number(),
+    endedAt: v.union(v.number(), v.null()),
+    maxReps: v.number(),
+    caloriesEstimate: v.number(),
+    updatedAt: v.number(),
+    dayKey: v.string(),
+  })
+    .index("by_userId_and_dayKey", ["userId", "dayKey"])
+    .index("by_roomId_and_deviceId_and_updatedAt", [
+      "roomId",
+      "deviceId",
+      "updatedAt",
+    ]),
 });

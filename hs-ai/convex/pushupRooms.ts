@@ -16,6 +16,7 @@ const MAX_POSE_LANDMARKS = 64;
 const MAX_HANDS = 4;
 const MAX_HAND_LANDMARKS = 42;
 const MAX_MESSAGES_PER_POLL = 200;
+const CALORIES_PER_REP = 0.42;
 
 const wireLandmarkValidator = v.object({
   x: v.number(),
@@ -48,6 +49,20 @@ function normalizeUsername(username: string): string {
   const fallback = "Anonymous";
   const next = username.trim().slice(0, USERNAME_MAX);
   return next.length > 0 ? next : fallback;
+}
+
+function normalizeUserId(userId: string | null): string | null {
+  if (!userId) return null;
+  const next = userId.trim();
+  return next.length > 0 ? next : null;
+}
+
+function dayKeyFromTimestamp(timestamp: number): string {
+  return new Date(timestamp).toISOString().slice(0, 10);
+}
+
+function caloriesFromReps(reps: number): number {
+  return Number((Math.max(0, reps) * CALORIES_PER_REP).toFixed(1));
 }
 
 function sanitizeLandmarkList(
@@ -105,6 +120,7 @@ export const upsertDevice = mutation({
   args: {
     roomId: v.string(),
     deviceId: v.string(),
+    userId: v.union(v.string(), v.null()),
     username: v.string(),
     reps: v.number(),
     poseLandmarks: v.array(wireLandmarkValidator),
@@ -113,6 +129,7 @@ export const upsertDevice = mutation({
   handler: async (ctx, args) => {
     const roomId = normalizeRoomId(args.roomId);
     const deviceId = normalizeDeviceId(args.deviceId);
+    const userId = normalizeUserId(args.userId);
     if (!roomId) {
       throw new ConvexError("Invalid room ID.");
     }
@@ -138,11 +155,12 @@ export const upsertDevice = mutation({
       )
       .unique();
 
+    const nextReps = Math.max(existing?.reps ?? 0, normalizedReps);
     const next = {
       roomId,
       deviceId,
       username: normalizedUsername,
-      reps: Math.max(existing?.reps ?? 0, normalizedReps),
+      reps: nextReps,
       updatedAt: now,
       poseLandmarks,
       handLandmarks,
@@ -152,6 +170,53 @@ export const upsertDevice = mutation({
       await ctx.db.patch(existing._id, next);
     } else {
       await ctx.db.insert("pushupRoomDevices", next);
+    }
+
+    const leaderboardUserId = userId ?? `device:${deviceId}`;
+    const existingLeaderboard = await ctx.db
+      .query("pushupRoomLeaderboard")
+      .withIndex("by_roomId_and_userId", (q) =>
+        q.eq("roomId", roomId).eq("userId", leaderboardUserId),
+      )
+      .unique();
+
+    const bestReps = Math.max(existingLeaderboard?.bestReps ?? 0, nextReps);
+    const currentReps = Math.max(existingLeaderboard?.currentReps ?? 0, nextReps);
+    const leaderboardPayload = {
+      roomId,
+      userId: leaderboardUserId,
+      username: normalizedUsername,
+      bestReps,
+      currentReps,
+      updatedAt: now,
+    };
+
+    if (existingLeaderboard) {
+      await ctx.db.patch(existingLeaderboard._id, leaderboardPayload);
+    } else {
+      await ctx.db.insert("pushupRoomLeaderboard", leaderboardPayload);
+    }
+
+    if (userId) {
+      const recentSessions = await ctx.db
+        .query("pushupSessions")
+        .withIndex("by_roomId_and_deviceId_and_updatedAt", (q) =>
+          q.eq("roomId", roomId).eq("deviceId", deviceId),
+        )
+        .order("desc")
+        .take(8);
+
+      const openSession = recentSessions.find(
+        (session) => session.userId === userId && session.endedAt === null,
+      );
+      if (openSession) {
+        await ctx.db.patch(openSession._id, {
+          username: normalizedUsername,
+          maxReps: Math.max(openSession.maxReps, nextReps),
+          caloriesEstimate: caloriesFromReps(Math.max(openSession.maxReps, nextReps)),
+          updatedAt: now,
+        });
+      }
     }
 
     await pruneStaleDevices(roomId, now - STALE_MS, ctx);
@@ -211,6 +276,292 @@ export const getDevices = query({
       poseLandmarks: device.poseLandmarks,
       handLandmarks: device.handLandmarks,
     }));
+  },
+});
+
+export const getRoomLeaderboard = query({
+  args: {
+    roomId: v.string(),
+  },
+  handler: async (ctx, args) => {
+    const roomId = normalizeRoomId(args.roomId);
+    if (!roomId) {
+      throw new ConvexError("Invalid room ID.");
+    }
+
+    const rows = await ctx.db
+      .query("pushupRoomLeaderboard")
+      .withIndex("by_roomId_and_bestReps", (q) => q.eq("roomId", roomId))
+      .order("desc")
+      .take(16);
+
+    return rows.map((row) => ({
+      userId: row.userId,
+      username: row.username,
+      reps: row.bestReps,
+      updatedAt: row.updatedAt,
+    }));
+  },
+});
+
+export const startSession = mutation({
+  args: {
+    roomId: v.string(),
+    deviceId: v.string(),
+    userId: v.string(),
+    username: v.string(),
+    initialReps: v.number(),
+  },
+  handler: async (ctx, args) => {
+    const roomId = normalizeRoomId(args.roomId);
+    const deviceId = normalizeDeviceId(args.deviceId);
+    const userId = normalizeUserId(args.userId);
+    if (!roomId || !deviceId || !userId) {
+      throw new ConvexError("Invalid session identifiers.");
+    }
+
+    const now = Date.now();
+    const initialReps = clamp(Math.floor(args.initialReps), 0, MAX_REPS);
+    const username = normalizeUsername(args.username);
+
+    const recentSessions = await ctx.db
+      .query("pushupSessions")
+      .withIndex("by_roomId_and_deviceId_and_updatedAt", (q) =>
+        q.eq("roomId", roomId).eq("deviceId", deviceId),
+      )
+      .order("desc")
+      .take(8);
+
+    const openSession = recentSessions.find(
+      (session) => session.userId === userId && session.endedAt === null,
+    );
+    if (openSession) {
+      await ctx.db.patch(openSession._id, {
+        username,
+        maxReps: Math.max(openSession.maxReps, initialReps),
+        caloriesEstimate: caloriesFromReps(Math.max(openSession.maxReps, initialReps)),
+        updatedAt: now,
+        dayKey: dayKeyFromTimestamp(now),
+      });
+      return { ok: true, sessionId: openSession._id };
+    }
+
+    const sessionId = await ctx.db.insert("pushupSessions", {
+      userId,
+      roomId,
+      deviceId,
+      username,
+      startedAt: now,
+      endedAt: null,
+      maxReps: initialReps,
+      caloriesEstimate: caloriesFromReps(initialReps),
+      updatedAt: now,
+      dayKey: dayKeyFromTimestamp(now),
+    });
+    return { ok: true, sessionId };
+  },
+});
+
+export const endSession = mutation({
+  args: {
+    roomId: v.string(),
+    deviceId: v.string(),
+    userId: v.string(),
+    username: v.string(),
+    finalReps: v.number(),
+  },
+  handler: async (ctx, args) => {
+    const roomId = normalizeRoomId(args.roomId);
+    const deviceId = normalizeDeviceId(args.deviceId);
+    const userId = normalizeUserId(args.userId);
+    if (!roomId || !deviceId || !userId) {
+      throw new ConvexError("Invalid session identifiers.");
+    }
+
+    const now = Date.now();
+    const finalReps = clamp(Math.floor(args.finalReps), 0, MAX_REPS);
+    const username = normalizeUsername(args.username);
+
+    const recentSessions = await ctx.db
+      .query("pushupSessions")
+      .withIndex("by_roomId_and_deviceId_and_updatedAt", (q) =>
+        q.eq("roomId", roomId).eq("deviceId", deviceId),
+      )
+      .order("desc")
+      .take(8);
+
+    const openSession = recentSessions.find(
+      (session) => session.userId === userId && session.endedAt === null,
+    );
+
+    if (openSession) {
+      const maxReps = Math.max(openSession.maxReps, finalReps);
+      await ctx.db.patch(openSession._id, {
+        username,
+        maxReps,
+        caloriesEstimate: caloriesFromReps(maxReps),
+        updatedAt: now,
+        endedAt: now,
+        dayKey: dayKeyFromTimestamp(now),
+      });
+      return { ok: true, sessionId: openSession._id };
+    }
+
+    const sessionId = await ctx.db.insert("pushupSessions", {
+      userId,
+      roomId,
+      deviceId,
+      username,
+      startedAt: now,
+      endedAt: now,
+      maxReps: finalReps,
+      caloriesEstimate: caloriesFromReps(finalReps),
+      updatedAt: now,
+      dayKey: dayKeyFromTimestamp(now),
+    });
+    return { ok: true, sessionId };
+  },
+});
+
+export const getCalendarInsights = query({
+  args: {
+    userId: v.string(),
+    selectedDayTs: v.number(),
+  },
+  handler: async (ctx, args) => {
+    const userId = normalizeUserId(args.userId);
+    if (!userId) {
+      throw new ConvexError("Invalid user ID.");
+    }
+
+    const selectedTs = Number.isFinite(args.selectedDayTs)
+      ? args.selectedDayTs
+      : Date.now();
+    const selectedDayKey = dayKeyFromTimestamp(selectedTs);
+
+    const selectedDaySessions = await ctx.db
+      .query("pushupSessions")
+      .withIndex("by_userId_and_dayKey", (q) =>
+        q.eq("userId", userId).eq("dayKey", selectedDayKey),
+      )
+      .order("desc")
+      .take(200);
+
+    const now = Date.now();
+    const weekStart = new Date(selectedTs);
+    weekStart.setDate(weekStart.getDate() - 6);
+    const weekStartKey = dayKeyFromTimestamp(weekStart.getTime());
+    const todayKey = dayKeyFromTimestamp(now);
+
+    const weeklySessions = await ctx.db
+      .query("pushupSessions")
+      .withIndex("by_userId_and_dayKey", (q) =>
+        q
+          .eq("userId", userId)
+          .gte("dayKey", weekStartKey)
+          .lte("dayKey", todayKey),
+      )
+      .take(500);
+
+    const recentWindowStart = new Date(now);
+    recentWindowStart.setDate(recentWindowStart.getDate() - 180);
+    const recentWindowKey = dayKeyFromTimestamp(recentWindowStart.getTime());
+    const recentSessions = await ctx.db
+      .query("pushupSessions")
+      .withIndex("by_userId_and_dayKey", (q) =>
+        q.eq("userId", userId).gte("dayKey", recentWindowKey),
+      )
+      .take(1200);
+
+    const calendarMap = new Map<
+      string,
+      { dayKey: string; workouts: number; totalReps: number; calories: number }
+    >();
+    for (const session of recentSessions) {
+      const item = calendarMap.get(session.dayKey) ?? {
+        dayKey: session.dayKey,
+        workouts: 0,
+        totalReps: 0,
+        calories: 0,
+      };
+      item.workouts += 1;
+      item.totalReps += session.maxReps;
+      item.calories += session.caloriesEstimate;
+      calendarMap.set(session.dayKey, item);
+    }
+
+    const dayKeys = Array.from(calendarMap.keys()).sort();
+    let currentStreak = 0;
+    let longestStreak = 0;
+    if (dayKeys.length > 0) {
+      let run = 1;
+      for (let i = 1; i < dayKeys.length; i += 1) {
+        const prev = new Date(`${dayKeys[i - 1]}T00:00:00.000Z`).getTime();
+        const curr = new Date(`${dayKeys[i]}T00:00:00.000Z`).getTime();
+        if (curr - prev === 24 * 60 * 60 * 1000) {
+          run += 1;
+        } else {
+          longestStreak = Math.max(longestStreak, run);
+          run = 1;
+        }
+      }
+      longestStreak = Math.max(longestStreak, run);
+
+      const today = dayKeyFromTimestamp(now);
+      const yesterday = dayKeyFromTimestamp(now - 24 * 60 * 60 * 1000);
+      const active = new Set(dayKeys);
+      const anchor = active.has(today) ? today : active.has(yesterday) ? yesterday : null;
+      if (anchor) {
+        let cursor = new Date(`${anchor}T00:00:00.000Z`).getTime();
+        while (active.has(dayKeyFromTimestamp(cursor))) {
+          currentStreak += 1;
+          cursor -= 24 * 60 * 60 * 1000;
+        }
+      }
+    }
+
+    const reduceStats = (sessions: typeof selectedDaySessions) =>
+      sessions.reduce(
+        (acc, session) => ({
+          workouts: acc.workouts + 1,
+          totalReps: acc.totalReps + session.maxReps,
+          calories: Number((acc.calories + session.caloriesEstimate).toFixed(1)),
+          minutes:
+            acc.minutes +
+            Math.max(
+              0,
+              Math.round(
+                ((session.endedAt ?? session.updatedAt) - session.startedAt) / 60000,
+              ),
+            ),
+        }),
+        { workouts: 0, totalReps: 0, calories: 0, minutes: 0 },
+      );
+
+    return {
+      selectedDaySessions: selectedDaySessions.map((session) => ({
+        _id: session._id,
+        roomId: session.roomId,
+        username: session.username,
+        startedAt: session.startedAt,
+        endedAt: session.endedAt,
+        maxReps: session.maxReps,
+        caloriesEstimate: session.caloriesEstimate,
+      })),
+      selectedDayStats: reduceStats(selectedDaySessions),
+      weeklyStats: reduceStats(weeklySessions),
+      calendarDays: Array.from(calendarMap.values()).map((item) => ({
+        dayKey: item.dayKey,
+        workouts: item.workouts,
+        totalReps: item.totalReps,
+        calories: Number(item.calories.toFixed(1)),
+      })),
+      streak: {
+        current: currentStreak,
+        longest: longestStreak,
+        lastActiveDayKey: dayKeys.length > 0 ? dayKeys[dayKeys.length - 1] : null,
+      },
+    };
   },
 });
 

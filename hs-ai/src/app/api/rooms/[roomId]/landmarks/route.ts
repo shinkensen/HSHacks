@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { auth, currentUser } from "@clerk/nextjs/server";
 
 import {
   clamp,
@@ -17,6 +18,13 @@ const STALE_MS = 12_000;
 
 type InMemoryRoomStore = {
   devices: Map<string, DeviceFeed>;
+};
+
+type LeaderboardEntry = {
+  userId: string;
+  username: string;
+  reps: number;
+  updatedAt: number;
 };
 
 const globalStore = globalThis as typeof globalThis & {
@@ -74,6 +82,12 @@ function parseBody(body: unknown): DeviceFeed | null {
   };
 }
 
+function deriveClerkDisplayName(user: Awaited<ReturnType<typeof currentUser>>): string | undefined {
+  if (!user) return undefined;
+  const emailLocalPart = user.primaryEmailAddress?.emailAddress?.split("@")[0];
+  return user.fullName ?? user.username ?? emailLocalPart;
+}
+
 export async function GET(
   _request: NextRequest,
   context: { params: Promise<{ roomId: string }> },
@@ -88,14 +102,30 @@ export async function GET(
     const devices = await queryConvex<DeviceFeed[]>("pushupRooms:getDevices", {
       roomId: normalizedRoomId,
     });
+    const leaderboard = await queryConvex<LeaderboardEntry[]>(
+      "pushupRooms:getRoomLeaderboard",
+      {
+        roomId: normalizedRoomId,
+      },
+    );
 
-    return NextResponse.json({ roomId: normalizedRoomId, devices });
+    return NextResponse.json({ roomId: normalizedRoomId, devices, leaderboard });
   } catch {
     const room = getRoom(normalizedRoomId);
     pruneRoom(room);
+    const leaderboard = Array.from(room.devices.values())
+      .sort((a, b) => b.reps - a.reps)
+      .slice(0, 12)
+      .map((device) => ({
+        userId: device.deviceId,
+        username: device.username,
+        reps: device.reps,
+        updatedAt: device.updatedAt,
+      }));
     return NextResponse.json({
       roomId: normalizedRoomId,
       devices: Array.from(room.devices.values()),
+      leaderboard,
       relay: "memory",
     });
   }
@@ -122,12 +152,16 @@ export async function POST(
   if (!feed) {
     return NextResponse.json({ error: "deviceId is required" }, { status: 400 });
   }
+  const { userId } = await auth();
+  const user = userId ? await currentUser().catch(() => null) : null;
+  const username = normalizeUsername(deriveClerkDisplayName(user) ?? feed.username);
 
   try {
     await mutateConvex<{ ok: boolean }>("pushupRooms:upsertDevice", {
       roomId: normalizedRoomId,
       deviceId: feed.deviceId,
-      username: feed.username,
+      userId: userId ?? null,
+      username,
       reps: feed.reps,
       poseLandmarks: feed.poseLandmarks,
       handLandmarks: feed.handLandmarks,
@@ -142,7 +176,7 @@ export async function POST(
     room.devices.set(feed.deviceId, {
       ...feed,
       reps: Math.max(existing?.reps ?? 0, feed.reps),
-      username: feed.username || existing?.username || "Anonymous",
+      username: username || existing?.username || "Anonymous",
       updatedAt: Date.now(),
     });
 

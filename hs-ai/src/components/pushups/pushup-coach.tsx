@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { useUser } from "@clerk/nextjs";
 import {
   DrawingUtils,
   FilesetResolver,
@@ -8,12 +9,15 @@ import {
   PoseLandmarker,
 } from "@mediapipe/tasks-vision";
 
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Field, FieldGroup, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
-import { Progress, ProgressLabel, ProgressValue } from "@/components/ui/progress";
+import {
+  Progress,
+  ProgressLabel,
+  ProgressValue,
+} from "@/components/ui/progress";
 import {
   normalizeRoomId,
   normalizeUsername,
@@ -41,6 +45,13 @@ type RemoteMediaFeed = {
   stream: MediaStream;
 };
 
+type RoomLeaderboardEntry = {
+  userId: string;
+  username: string;
+  reps: number;
+  updatedAt: number;
+};
+
 type RoomJoinState = "idle" | "creating" | "joining" | "joined" | "error";
 
 const MODEL_URL =
@@ -52,79 +63,139 @@ const WASM_URL =
   "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.34/wasm";
 const MEDIAPIPE_DELEGATE: "CPU" | "GPU" = "CPU";
 
-const POSE_MIN_VIS = 0.45
-const MIN_REP_UP_ANGLE = 148
-const MIN_REP_FRAMES = 2
-const MIN_HIP_HEIGHT_DELTA = 0.025
-const MIN_ELBOW_EXCURSION = 45
-const ELBOW_ALPHA = 0.42
-const BODY_ALPHA = 0.22
-const REP_COOLDOWN_MS = 280
-const SHARE_PUSH_INTERVAL_MS = 100
-const SHARE_PULL_INTERVAL_MS = 180
-const SIGNAL_PULL_INTERVAL_MS = 300
-const LEADERBOARD_PUSH_THROTTLE_MS = 120
-const PRESENCE_HEARTBEAT_MS = 2000
+const POSE_MIN_VIS = 0.45;
+const MIN_REP_UP_ANGLE = 148;
+const MIN_REP_FRAMES = 2;
+const MIN_HIP_HEIGHT_DELTA = 0.025;
+const MIN_ELBOW_EXCURSION = 45;
+const ELBOW_ALPHA = 0.42;
+const BODY_ALPHA = 0.22;
+const REP_COOLDOWN_MS = 280;
+const SHARE_PUSH_INTERVAL_MS = 100;
+const SHARE_PULL_INTERVAL_MS = 180;
+const SIGNAL_PULL_INTERVAL_MS = 300;
+const LEADERBOARD_PUSH_THROTTLE_MS = 120;
+const PRESENCE_HEARTBEAT_MS = 2000;
 const DEVICE_ID_STORAGE_KEY = "pushup-room-device-id";
+const SESSION_ROOM_KEY = "pushup-room-session";
+const ROOM_BEST_REPS_KEY = "pushup-room-best-reps";
 
-const SHOULDER_L = 11
-const SHOULDER_R = 12
-const ELBOW_L = 13
-const ELBOW_R = 14
-const WRIST_L = 15
-const WRIST_R = 16
-const HIP_L = 23
-const HIP_R = 24
-const KNEE_L = 25
-const KNEE_R = 26
-const ANKLE_L = 27
-const ANKLE_R = 28
+function readStoredRoomSession(): string | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = sessionStorage.getItem(SESSION_ROOM_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as { roomId?: string };
+    const id = normalizeRoomId(parsed.roomId ?? "");
+    return id || null;
+  } catch {
+    return null;
+  }
+}
+
+function persistRoomSession(roomId: string) {
+  const id = normalizeRoomId(roomId);
+  if (!id || typeof window === "undefined") return;
+  sessionStorage.setItem(SESSION_ROOM_KEY, JSON.stringify({ roomId: id }));
+}
+
+function clearRoomSession() {
+  if (typeof window === "undefined") return;
+  sessionStorage.removeItem(SESSION_ROOM_KEY);
+}
+
+function readRoomBestReps(roomId: string): number {
+  if (typeof window === "undefined") return 0;
+  try {
+    const raw = localStorage.getItem(ROOM_BEST_REPS_KEY);
+    if (!raw) return 0;
+    const map = JSON.parse(raw) as Record<string, number>;
+    const id = normalizeRoomId(roomId);
+    const n = map[id];
+    return typeof n === "number" && Number.isFinite(n) && n > 0 ? n : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function writeRoomBestReps(roomId: string, reps: number) {
+  if (typeof window === "undefined") return;
+  try {
+    const id = normalizeRoomId(roomId);
+    if (!id) return;
+    const raw = localStorage.getItem(ROOM_BEST_REPS_KEY);
+    const map = raw ? (JSON.parse(raw) as Record<string, number>) : {};
+    const next = Math.max(map[id] ?? 0, reps);
+    map[id] = next;
+    localStorage.setItem(ROOM_BEST_REPS_KEY, JSON.stringify(map));
+  } catch {
+    // ignore quota / private mode
+  }
+}
+
+const SHOULDER_L = 11;
+const SHOULDER_R = 12;
+const ELBOW_L = 13;
+const ELBOW_R = 14;
+const WRIST_L = 15;
+const WRIST_R = 16;
+const HIP_L = 23;
+const HIP_R = 24;
+const KNEE_L = 25;
+const KNEE_R = 26;
+const ANKLE_L = 27;
+const ANKLE_R = 28;
 
 function clamp(value: number, min: number, max: number) {
-  return Math.max(min, Math.min(max, value))
+  return Math.max(min, Math.min(max, value));
 }
 
 function angleABC(a: Landmark, b: Landmark, c: Landmark) {
-  if (!a || !b || !c) return 0
-  const ab = { x: a.x - b.x, y: a.y - b.y }
-  const cb = { x: c.x - b.x, y: c.y - b.y }
-  const dot = ab.x * cb.x + ab.y * cb.y
-  const magAB = Math.hypot(ab.x, ab.y)
-  const magCB = Math.hypot(cb.x, cb.y)
-  if (magAB === 0 || magCB === 0) return 0
-  const cosine = clamp(dot / (magAB * magCB), -1, 1)
-  return (Math.acos(cosine) * 180) / Math.PI
+  if (!a || !b || !c) return 0;
+  const ab = { x: a.x - b.x, y: a.y - b.y };
+  const cb = { x: c.x - b.x, y: c.y - b.y };
+  const dot = ab.x * cb.x + ab.y * cb.y;
+  const magAB = Math.hypot(ab.x, ab.y);
+  const magCB = Math.hypot(cb.x, cb.y);
+  if (magAB === 0 || magCB === 0) return 0;
+  const cosine = clamp(dot / (magAB * magCB), -1, 1);
+  return (Math.acos(cosine) * 180) / Math.PI;
 }
 
-function angleBetween(v1: { x: number; y: number }, v2: { x: number; y: number }) {
-  const dot = v1.x * v2.x + v1.y * v2.y
-  const magV1 = Math.hypot(v1.x, v1.y)
-  const magV2 = Math.hypot(v2.x, v2.y)
-  if (magV1 === 0 || magV2 === 0) return 0
-  const cosine = clamp(dot / (magV1 * magV2), -1, 1)
-  return (Math.acos(cosine) * 180) / Math.PI
+function angleBetween(
+  v1: { x: number; y: number },
+  v2: { x: number; y: number },
+) {
+  const dot = v1.x * v2.x + v1.y * v2.y;
+  const magV1 = Math.hypot(v1.x, v1.y);
+  const magV2 = Math.hypot(v2.x, v2.y);
+  if (magV1 === 0 || magV2 === 0) return 0;
+  const cosine = clamp(dot / (magV1 * magV2), -1, 1);
+  return (Math.acos(cosine) * 180) / Math.PI;
 }
 
 function distance2D(a: Landmark, b: Landmark) {
-  return Math.hypot(a.x - b.x, a.y - b.y)
+  return Math.hypot(a.x - b.x, a.y - b.y);
 }
 
 function isVisible(lm: Landmark | undefined, min = POSE_MIN_VIS) {
-  return !!lm && (lm.visibility ?? 0) >= min
+  return !!lm && (lm.visibility ?? 0) >= min;
 }
 
 function ema(next: number, prev: number | null, alpha: number) {
-  if (prev === null) return next
-  return prev + alpha * (next - prev)
+  if (prev === null) return next;
+  return prev + alpha * (next - prev);
 }
 
 function randomId() {
-  return Math.random().toString(36).slice(2, 10)
+  return Math.random().toString(36).slice(2, 10);
 }
 
-async function withSuppressedMediapipeInfo<T>(fn: () => Promise<T>): Promise<T> {
+function withSuppressedMediapipeInfo<T>(fn: () => T): T {
   const originalError = console.error;
   const originalWarn = console.warn;
+  const originalInfo = console.info;
+  const originalLog = console.log;
   const shouldSuppress = (args: unknown[]) =>
     args.some(
       (arg) =>
@@ -140,49 +211,71 @@ async function withSuppressedMediapipeInfo<T>(fn: () => Promise<T>): Promise<T> 
     if (shouldSuppress(args)) return;
     originalWarn(...args);
   };
+  console.info = (...args: unknown[]) => {
+    if (shouldSuppress(args)) return;
+    originalInfo(...args);
+  };
+  console.log = (...args: unknown[]) => {
+    if (shouldSuppress(args)) return;
+    originalLog(...args);
+  };
 
   try {
-    return await fn();
+    return fn();
   } finally {
     console.error = originalError;
     console.warn = originalWarn;
+    console.info = originalInfo;
+    console.log = originalLog;
   }
 }
 
-function normalizeWireLandmarks(landmarks: WireLandmark[] | undefined): Landmark[] {
-  if (!landmarks) return []
+function normalizeWireLandmarks(
+  landmarks: WireLandmark[] | undefined,
+): Landmark[] {
+  if (!landmarks) return [];
   return landmarks.map((lm) => ({
     x: lm.x,
     y: lm.y,
     z: lm.z,
     visibility: lm.visibility ?? 1,
-  }))
+  }));
 }
 
 function roomColorFromId(deviceId: string) {
-  const palette = ['#ffd166', '#ef476f', '#06d6a0', '#4cc9f0', '#f78c6b', '#b8f2e6']
-  let hash = 0
+  const palette = [
+    "#ffd166",
+    "#ef476f",
+    "#06d6a0",
+    "#4cc9f0",
+    "#f78c6b",
+    "#b8f2e6",
+  ];
+  let hash = 0;
   for (let i = 0; i < deviceId.length; i += 1) {
-    hash = (hash * 31 + deviceId.charCodeAt(i)) >>> 0
+    hash = (hash * 31 + deviceId.charCodeAt(i)) >>> 0;
   }
-  return palette[hash % palette.length]
+  return palette[hash % palette.length];
 }
 
-function toSignalDescription(payload: unknown): RTCSessionDescriptionInit | null {
-  if (!payload || typeof payload !== 'object') return null
-  const maybe = payload as { type?: string; sdp?: string }
-  if (!maybe.type) return null
-  return { type: maybe.type as RTCSdpType, sdp: maybe.sdp }
+function toSignalDescription(
+  payload: unknown,
+): RTCSessionDescriptionInit | null {
+  if (!payload || typeof payload !== "object") return null;
+  const maybe = payload as { type?: string; sdp?: string };
+  if (!maybe.type) return null;
+  return { type: maybe.type as RTCSdpType, sdp: maybe.sdp };
 }
 
 function toIceCandidate(payload: unknown): RTCIceCandidateInit | null {
-  if (!payload || typeof payload !== 'object') return null
-  const maybe = payload as RTCIceCandidateInit
-  if (!maybe.candidate) return null
-  return maybe
+  if (!payload || typeof payload !== "object") return null;
+  const maybe = payload as RTCIceCandidateInit;
+  if (!maybe.candidate) return null;
+  return maybe;
 }
 
 export function PushupCoach() {
+  const { user } = useUser();
   const [isCameraOn, setIsCameraOn] = useState(false);
   const [statusText, setStatusText] = useState("Loading models...");
   const [qualityScore, setQualityScore] = useState(0);
@@ -196,6 +289,10 @@ export function PushupCoach() {
   const [roomId, setRoomId] = useState("pushups");
   const [shareEnabled, setShareEnabled] = useState(false);
   const [remoteFeeds, setRemoteFeeds] = useState<RemoteDeviceFeed[]>([]);
+  const [roomLeaderboard, setRoomLeaderboard] = useState<
+    RoomLeaderboardEntry[]
+  >([]);
+  const [persistedRoomBestReps, setPersistedRoomBestReps] = useState(0);
   const [remoteMediaFeeds, setRemoteMediaFeeds] = useState<RemoteMediaFeed[]>(
     [],
   );
@@ -206,9 +303,9 @@ export function PushupCoach() {
   const [showShareCameraAlert, setShowShareCameraAlert] = useState(false);
   const [targetReps, setTargetReps] = useState(40);
   const [repTimestamps, setRepTimestamps] = useState<number[]>([]);
-  const [formHistory, setFormHistory] = useState<Array<{ ts: number; score: number }>>(
-    [],
-  );
+  const [formHistory, setFormHistory] = useState<
+    Array<{ ts: number; score: number }>
+  >([]);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -245,86 +342,147 @@ export function PushupCoach() {
   const lastRepRecordedAtRef = useRef<number | null>(null);
 
   function formatDuration(totalSeconds: number) {
-    const minutes = Math.floor(totalSeconds / 60)
-    const seconds = totalSeconds % 60
-    return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
   }
 
   function ensureDeviceId() {
-    if (deviceIdRef.current !== 'dev-pending') {
-      return deviceIdRef.current
+    if (deviceIdRef.current !== "dev-pending") {
+      return deviceIdRef.current;
     }
 
-    if (typeof window !== 'undefined') {
-      const stored = window.localStorage.getItem(DEVICE_ID_STORAGE_KEY)
+    if (typeof window !== "undefined") {
+      const stored = window.localStorage.getItem(DEVICE_ID_STORAGE_KEY);
       if (stored && stored.trim()) {
-        deviceIdRef.current = stored
-        return deviceIdRef.current
+        deviceIdRef.current = stored;
+        return deviceIdRef.current;
       }
-      const created = `dev-${randomId()}`
-      deviceIdRef.current = created
-      window.localStorage.setItem(DEVICE_ID_STORAGE_KEY, created)
-      return deviceIdRef.current
+      const created = `dev-${randomId()}`;
+      deviceIdRef.current = created;
+      window.localStorage.setItem(DEVICE_ID_STORAGE_KEY, created);
+      return deviceIdRef.current;
     }
 
-    return deviceIdRef.current
+    return deviceIdRef.current;
   }
 
+  const profileUsername = useMemo(() => {
+    return (
+      user?.fullName?.trim() ||
+      user?.username?.trim() ||
+      user?.firstName?.trim() ||
+      user?.primaryEmailAddress?.emailAddress?.split("@")[0]?.trim() ||
+      ""
+    );
+  }, [user]);
+
   useEffect(() => {
-    const id = ensureDeviceId()
-    if (!username) {
-      setUsername(`User-${id.slice(-4)}`)
-    }
-  }, [username])
+    const id = ensureDeviceId();
+    const fallback = `User-${id.slice(-4)}`;
+    const next = profileUsername || fallback;
+    setUsername((prev) => (prev === next ? prev : next));
+  }, [profileUsername]);
 
   function getRoomPayload() {
-    const stableDeviceId = ensureDeviceId()
+    const stableDeviceId = ensureDeviceId();
     return {
       deviceId: stableDeviceId,
-      username:
+      username: normalizeUsername(
         username.trim().length > 0
-          ? normalizeUsername(username)
+          ? username
           : `User-${stableDeviceId.slice(-4)}`,
+      ),
       reps: repCount,
       updatedAt: Date.now(),
-    }
+    };
   }
 
   async function pushRoomPresence() {
-    const normalizedRoomId = normalizeRoomId(roomId)
-    if (!shareEnabled || !normalizedRoomId) return
-    const payload = getRoomPayload()
-    await fetch(`/api/rooms/${encodeURIComponent(normalizedRoomId)}/landmarks`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        ...payload,
-        poseLandmarks: [],
-        handLandmarks: [],
-      }),
-    })
+    const normalizedRoomId = normalizeRoomId(roomId);
+    if (!shareEnabled || !normalizedRoomId) return;
+    const payload = getRoomPayload();
+    await fetch(
+      `/api/rooms/${encodeURIComponent(normalizedRoomId)}/landmarks`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ...payload,
+          poseLandmarks: [],
+          handLandmarks: [],
+        }),
+      },
+    );
   }
 
-  const leaderboard = useMemo(
-    () =>
-      [
-        {
-          deviceId: ensureDeviceId(),
-          username: username.trim() || "You",
-          reps: repCount,
-          isSelf: true,
-        },
-        ...remoteFeeds.map((feed) => ({
-          deviceId: feed.deviceId,
-          username: feed.username || feed.deviceId,
-          reps: Number.isFinite(feed.reps) ? feed.reps : 0,
-          isSelf: false,
-        })),
-      ]
+  const leaderboard = useMemo(() => {
+    if (roomLeaderboard.length > 0) {
+      const me = profileUsername || username;
+      return roomLeaderboard
+        .map((entry) => {
+          const isSelf = entry.username === me;
+          return {
+            deviceId: entry.userId,
+            username: entry.username,
+            reps: isSelf
+              ? Math.max(entry.reps, repCount, persistedRoomBestReps)
+              : entry.reps,
+            isSelf,
+          };
+        })
         .sort((a, b) => b.reps - a.reps)
-        .slice(0, 10),
-    [remoteFeeds, repCount, username],
-  );
+        .slice(0, 10);
+    }
+
+    const selfReps = Math.max(repCount, persistedRoomBestReps);
+    return [
+      {
+        deviceId: ensureDeviceId(),
+        username: username.trim() || "You",
+        reps: selfReps,
+        isSelf: true,
+      },
+      ...remoteFeeds.map((feed) => ({
+        deviceId: feed.deviceId,
+        username: feed.username || feed.deviceId,
+        reps: Number.isFinite(feed.reps) ? feed.reps : 0,
+        isSelf: false,
+      })),
+    ]
+      .sort((a, b) => b.reps - a.reps)
+      .slice(0, 10);
+  }, [
+    profileUsername,
+    persistedRoomBestReps,
+    remoteFeeds,
+    repCount,
+    roomLeaderboard,
+    username,
+  ]);
+
+  useEffect(() => {
+    const id = normalizeRoomId(roomId);
+    if (!id || typeof window === "undefined") return;
+    setPersistedRoomBestReps(readRoomBestReps(id));
+  }, [roomId]);
+
+  useEffect(() => {
+    const id = normalizeRoomId(roomId);
+    if (!id || repCount <= 0) return;
+    writeRoomBestReps(id, repCount);
+    setPersistedRoomBestReps((prev) => Math.max(prev, repCount));
+  }, [repCount, roomId]);
+
+  useEffect(() => {
+    const me = profileUsername || username;
+    const row = roomLeaderboard.find((e) => e.username === me);
+    if (!row || row.reps <= 0) return;
+    const id = normalizeRoomId(roomId);
+    if (!id) return;
+    writeRoomBestReps(id, row.reps);
+    setPersistedRoomBestReps((prev) => Math.max(prev, row.reps));
+  }, [roomLeaderboard, profileUsername, username, roomId]);
 
   const calorieEstimate = useMemo(() => {
     return Number((repCount * 0.42).toFixed(1));
@@ -339,7 +497,9 @@ export function PushupCoach() {
     if (repTimestamps.length < 2) return [] as number[];
     const durations: number[] = [];
     for (let i = 1; i < repTimestamps.length; i += 1) {
-      durations.push(Math.max(0.1, (repTimestamps[i] - repTimestamps[i - 1]) / 1000));
+      durations.push(
+        Math.max(0.1, (repTimestamps[i] - repTimestamps[i - 1]) / 1000),
+      );
     }
     return durations.slice(-12);
   }, [repTimestamps]);
@@ -357,28 +517,28 @@ export function PushupCoach() {
   }, [formHistory]);
 
   useEffect(() => {
-    remoteFeedsRef.current = remoteFeeds
-  }, [remoteFeeds])
+    remoteFeedsRef.current = remoteFeeds;
+  }, [remoteFeeds]);
 
   useEffect(() => {
-    remoteMediaFeedsRef.current = remoteMediaFeeds
-  }, [remoteMediaFeeds])
+    remoteMediaFeedsRef.current = remoteMediaFeeds;
+  }, [remoteMediaFeeds]);
 
   useEffect(() => {
-    const normalizedRoomId = normalizeRoomId(roomId)
+    const normalizedRoomId = normalizeRoomId(roomId);
     if (!shareEnabled || !normalizedRoomId) {
-      return
+      return;
     }
 
-    const now = performance.now()
+    const now = performance.now();
     if (now - lastLeaderboardPushAtRef.current < LEADERBOARD_PUSH_THROTTLE_MS) {
-      return
+      return;
     }
-    lastLeaderboardPushAtRef.current = now
+    lastLeaderboardPushAtRef.current = now;
 
     void fetch(`/api/rooms/${encodeURIComponent(normalizedRoomId)}/landmarks`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         deviceId: ensureDeviceId(),
         username:
@@ -390,93 +550,105 @@ export function PushupCoach() {
         poseLandmarks: [],
         handLandmarks: [],
       }),
-    })
-  }, [shareEnabled, roomId, repCount, username])
+    });
+  }, [shareEnabled, roomId, repCount, username]);
 
   useEffect(() => {
-    const normalizedRoomId = normalizeRoomId(roomId)
+    const normalizedRoomId = normalizeRoomId(roomId);
     if (!shareEnabled || !normalizedRoomId) {
-      return
+      return;
     }
 
-    let stopped = false
+    let stopped = false;
 
     async function pullRoomFeeds() {
       try {
         const response = await fetch(
           `/api/rooms/${encodeURIComponent(normalizedRoomId)}/landmarks`,
-          { cache: 'no-store' },
-        )
+          { cache: "no-store" },
+        );
         if (!response.ok || stopped) {
-          return
+          return;
         }
-        const data = (await response.json()) as { devices?: RemoteDeviceFeed[] }
-        const devices = (data.devices ?? []).filter((d) => d.deviceId !== ensureDeviceId())
-        setRemoteFeeds(devices)
-        if (roomJoinState === 'joined') {
+        const data = (await response.json()) as {
+          devices?: RemoteDeviceFeed[];
+          leaderboard?: RoomLeaderboardEntry[];
+        };
+        const devices = (data.devices ?? []).filter(
+          (d) => d.deviceId !== ensureDeviceId(),
+        );
+        setRemoteFeeds(devices);
+        setRoomLeaderboard(data.leaderboard ?? []);
+        if (roomJoinState === "joined") {
           setRoomProgressText(
             `Connected to room "${normalizedRoomId}". Peers online: ${devices.length}.`,
-          )
+          );
         }
       } catch {
         if (!stopped) {
-          setStatusText('Room relay unreachable. Verify server/network connection.')
-          setRoomJoinState('error')
-          setRoomProgressText('Room connection lost. Retrying...')
+          setStatusText(
+            "Room relay unreachable. Verify server/network connection.",
+          );
+          setRoomJoinState("error");
+          setRoomProgressText("Room connection lost. Retrying...");
         }
       }
     }
 
-    pullRoomFeeds()
-    const interval = window.setInterval(pullRoomFeeds, SHARE_PULL_INTERVAL_MS)
+    pullRoomFeeds();
+    const interval = window.setInterval(pullRoomFeeds, SHARE_PULL_INTERVAL_MS);
 
     return () => {
-      stopped = true
-      window.clearInterval(interval)
-    }
-  }, [shareEnabled, roomId, roomJoinState])
+      stopped = true;
+      window.clearInterval(interval);
+    };
+  }, [shareEnabled, roomId, roomJoinState]);
 
   useEffect(() => {
-    const normalizedRoomId = normalizeRoomId(roomId)
+    const normalizedRoomId = normalizeRoomId(roomId);
     if (!shareEnabled || !normalizedRoomId) {
       if (presenceTimerRef.current !== null) {
-        window.clearInterval(presenceTimerRef.current)
-        presenceTimerRef.current = null
+        window.clearInterval(presenceTimerRef.current);
+        presenceTimerRef.current = null;
       }
-      return
+      return;
     }
 
-    void pushRoomPresence()
+    void pushRoomPresence();
     presenceTimerRef.current = window.setInterval(() => {
-      void pushRoomPresence()
-    }, PRESENCE_HEARTBEAT_MS)
+      void pushRoomPresence();
+    }, PRESENCE_HEARTBEAT_MS);
 
     return () => {
       if (presenceTimerRef.current !== null) {
-        window.clearInterval(presenceTimerRef.current)
-        presenceTimerRef.current = null
+        window.clearInterval(presenceTimerRef.current);
+        presenceTimerRef.current = null;
       }
-    }
-  }, [shareEnabled, roomId, username, repCount]) // eslint-disable-line react-hooks/exhaustive-deps
+    };
+  }, [shareEnabled, roomId, username, repCount]); // eslint-disable-line react-hooks/exhaustive-deps
 
   function shouldInitiateWith(remoteDeviceId: string) {
-    return ensureDeviceId() < remoteDeviceId
+    return ensureDeviceId() < remoteDeviceId;
   }
 
   function upsertRemoteMedia(deviceId: string, stream: MediaStream) {
     setRemoteMediaFeeds((prev) => {
-      const existingIndex = prev.findIndex((item) => item.deviceId === deviceId)
+      const existingIndex = prev.findIndex(
+        (item) => item.deviceId === deviceId,
+      );
       if (existingIndex === -1) {
-        return [...prev, { deviceId, stream }]
+        return [...prev, { deviceId, stream }];
       }
-      const next = [...prev]
-      next[existingIndex] = { deviceId, stream }
-      return next
-    })
+      const next = [...prev];
+      next[existingIndex] = { deviceId, stream };
+      return next;
+    });
   }
 
   function removeRemoteMedia(deviceId: string) {
-    setRemoteMediaFeeds((prev) => prev.filter((item) => item.deviceId !== deviceId))
+    setRemoteMediaFeeds((prev) =>
+      prev.filter((item) => item.deviceId !== deviceId),
+    );
   }
 
   async function sendSignal(
@@ -485,367 +657,472 @@ export function PushupCoach() {
     toDeviceId?: string,
     overrideRoomId?: string,
   ) {
-    const normalizedRoomId = normalizeRoomId(overrideRoomId ?? roomId)
-    if (!normalizedRoomId) return
+    const normalizedRoomId = normalizeRoomId(overrideRoomId ?? roomId);
+    if (!normalizedRoomId) return;
 
     await fetch(`/api/rooms/${encodeURIComponent(normalizedRoomId)}/signals`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         fromDeviceId: ensureDeviceId(),
         toDeviceId,
         type,
         payload,
+        username: normalizeUsername(username),
+        finalReps: repCount,
       }),
-    })
+    });
   }
 
   function closePeer(remoteDeviceId: string) {
-    const existing = peerConnectionsRef.current.get(remoteDeviceId)
+    const existing = peerConnectionsRef.current.get(remoteDeviceId);
     if (existing) {
-      existing.onicecandidate = null
-      existing.ontrack = null
-      existing.onconnectionstatechange = null
-      existing.close()
-      peerConnectionsRef.current.delete(remoteDeviceId)
+      existing.onicecandidate = null;
+      existing.ontrack = null;
+      existing.onconnectionstatechange = null;
+      existing.close();
+      peerConnectionsRef.current.delete(remoteDeviceId);
     }
-    removeRemoteMedia(remoteDeviceId)
+    removeRemoteMedia(remoteDeviceId);
   }
 
   function closeAllPeers() {
     for (const remoteDeviceId of peerConnectionsRef.current.keys()) {
-      closePeer(remoteDeviceId)
+      closePeer(remoteDeviceId);
     }
   }
 
   function ensurePeer(remoteDeviceId: string) {
-    const existing = peerConnectionsRef.current.get(remoteDeviceId)
+    const existing = peerConnectionsRef.current.get(remoteDeviceId);
     if (existing) {
-      return existing
+      return existing;
     }
 
     const pc = new RTCPeerConnection({
-      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
-    })
+      iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+    });
 
-    const localStream = streamRef.current
+    const localStream = streamRef.current;
     if (localStream) {
       for (const track of localStream.getTracks()) {
-        pc.addTrack(track, localStream)
+        pc.addTrack(track, localStream);
       }
     }
 
     pc.onicecandidate = (event) => {
       if (event.candidate) {
-        void sendSignal('ice', event.candidate.toJSON(), remoteDeviceId)
+        void sendSignal("ice", event.candidate.toJSON(), remoteDeviceId);
       }
-    }
+    };
 
     pc.ontrack = (event) => {
-      const firstStream = event.streams[0]
+      const firstStream = event.streams[0];
       if (firstStream) {
-        upsertRemoteMedia(remoteDeviceId, firstStream)
+        upsertRemoteMedia(remoteDeviceId, firstStream);
       }
-    }
+    };
 
     pc.onconnectionstatechange = () => {
-      const state = pc.connectionState
-      if (state === 'failed' || state === 'closed' || state === 'disconnected') {
-        closePeer(remoteDeviceId)
+      const state = pc.connectionState;
+      if (
+        state === "failed" ||
+        state === "closed" ||
+        state === "disconnected"
+      ) {
+        closePeer(remoteDeviceId);
       }
-    }
+    };
 
-    peerConnectionsRef.current.set(remoteDeviceId, pc)
-    return pc
+    peerConnectionsRef.current.set(remoteDeviceId, pc);
+    return pc;
   }
 
   async function createOfferFor(remoteDeviceId: string) {
-    const pc = ensurePeer(remoteDeviceId)
-    const offer = await pc.createOffer()
-    await pc.setLocalDescription(offer)
-    await sendSignal('offer', offer, remoteDeviceId)
+    const pc = ensurePeer(remoteDeviceId);
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    await sendSignal("offer", offer, remoteDeviceId);
   }
 
   async function attachTracksAndRenegotiate() {
-    const localStream = streamRef.current
-    if (!localStream) return
+    const localStream = streamRef.current;
+    if (!localStream) return;
 
     for (const [remoteDeviceId, pc] of peerConnectionsRef.current.entries()) {
       const hasVideoSender = pc
         .getSenders()
-        .some((sender) => sender.track?.kind === 'video' || sender.track?.kind === 'audio')
+        .some(
+          (sender) =>
+            sender.track?.kind === "video" || sender.track?.kind === "audio",
+        );
 
       if (!hasVideoSender) {
         for (const track of localStream.getTracks()) {
-          pc.addTrack(track, localStream)
+          pc.addTrack(track, localStream);
         }
       }
 
       if (shouldInitiateWith(remoteDeviceId)) {
-        await createOfferFor(remoteDeviceId)
+        await createOfferFor(remoteDeviceId);
       }
     }
   }
 
   async function handleSignalMessage(message: SignalMessage) {
-    const remoteDeviceId = message.fromDeviceId
-    if (!remoteDeviceId || remoteDeviceId === ensureDeviceId()) return
+    const remoteDeviceId = message.fromDeviceId;
+    if (!remoteDeviceId || remoteDeviceId === ensureDeviceId()) return;
 
-    if (message.type === 'join') {
-      ensurePeer(remoteDeviceId)
+    if (message.type === "join") {
+      ensurePeer(remoteDeviceId);
       if (shouldInitiateWith(remoteDeviceId)) {
-        await createOfferFor(remoteDeviceId)
+        await createOfferFor(remoteDeviceId);
       }
-      return
+      return;
     }
 
-    if (message.type === 'leave') {
-      closePeer(remoteDeviceId)
-      return
+    if (message.type === "leave") {
+      closePeer(remoteDeviceId);
+      return;
     }
 
-    if (message.type === 'offer') {
-      const offer = toSignalDescription(message.payload)
-      if (!offer) return
-      const pc = ensurePeer(remoteDeviceId)
-      await pc.setRemoteDescription(new RTCSessionDescription(offer))
-      const answer = await pc.createAnswer()
-      await pc.setLocalDescription(answer)
-      await sendSignal('answer', answer, remoteDeviceId)
-      return
+    if (message.type === "offer") {
+      const offer = toSignalDescription(message.payload);
+      if (!offer) return;
+      const pc = ensurePeer(remoteDeviceId);
+      await pc.setRemoteDescription(new RTCSessionDescription(offer));
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      await sendSignal("answer", answer, remoteDeviceId);
+      return;
     }
 
-    if (message.type === 'answer') {
-      const answer = toSignalDescription(message.payload)
-      if (!answer) return
-      const pc = ensurePeer(remoteDeviceId)
-      await pc.setRemoteDescription(new RTCSessionDescription(answer))
-      return
+    if (message.type === "answer") {
+      const answer = toSignalDescription(message.payload);
+      if (!answer) return;
+      const pc = ensurePeer(remoteDeviceId);
+      await pc.setRemoteDescription(new RTCSessionDescription(answer));
+      return;
     }
 
-    if (message.type === 'ice') {
-      const candidate = toIceCandidate(message.payload)
-      if (!candidate) return
-      const pc = ensurePeer(remoteDeviceId)
-      await pc.addIceCandidate(candidate)
+    if (message.type === "ice") {
+      const candidate = toIceCandidate(message.payload);
+      if (!candidate) return;
+      const pc = ensurePeer(remoteDeviceId);
+      await pc.addIceCandidate(candidate);
     }
   }
 
   function stopSignalPolling() {
     if (signalPollTimerRef.current !== null) {
-      window.clearInterval(signalPollTimerRef.current)
-      signalPollTimerRef.current = null
+      window.clearInterval(signalPollTimerRef.current);
+      signalPollTimerRef.current = null;
     }
   }
 
   function startSignalPolling(activeRoomId: string) {
-    stopSignalPolling()
-    signalCursorRef.current = 0
+    stopSignalPolling();
+    signalCursorRef.current = 0;
 
     const poll = async () => {
       try {
         const response = await fetch(
           `/api/rooms/${encodeURIComponent(activeRoomId)}/signals?deviceId=${encodeURIComponent(ensureDeviceId())}&since=${signalCursorRef.current}`,
-          { cache: 'no-store' },
-        )
+          { cache: "no-store" },
+        );
         if (!response.ok) {
-          return
+          return;
         }
-        const data = (await response.json()) as { messages?: SignalMessage[] }
-        const messages = data.messages ?? []
+        const data = (await response.json()) as { messages?: SignalMessage[] };
+        const messages = data.messages ?? [];
         for (const message of messages) {
-          signalCursorRef.current = Math.max(signalCursorRef.current, message.id)
-          await handleSignalMessage(message)
+          signalCursorRef.current = Math.max(
+            signalCursorRef.current,
+            message.id,
+          );
+          await handleSignalMessage(message);
         }
       } catch {
-        setRoomProgressText('Signaling interrupted. Retrying...')
+        setRoomProgressText("Signaling interrupted. Retrying...");
       }
-    }
+    };
 
-    void poll()
+    void poll();
     signalPollTimerRef.current = window.setInterval(() => {
-      void poll()
-    }, SIGNAL_PULL_INTERVAL_MS)
+      void poll();
+    }, SIGNAL_PULL_INTERVAL_MS);
   }
 
-  async function createRoom() {
-    const normalizedRoomId = normalizeRoomId(roomId)
-    if (!normalizedRoomId) {
-      setRoomJoinState('error')
-      setRoomProgressText('Enter a room name first.')
-      return
+  useEffect(() => {
+    const storedRoomId = readStoredRoomSession();
+    if (!storedRoomId) return;
+    const activeRoomId = storedRoomId;
+
+    let cancelled = false;
+
+    async function restoreSession() {
+      try {
+        const response = await fetch(
+          `/api/rooms/${encodeURIComponent(activeRoomId)}/landmarks`,
+          { cache: "no-store" },
+        );
+        if (!response.ok || cancelled) return;
+        const data = (await response.json()) as {
+          devices?: RemoteDeviceFeed[];
+          leaderboard?: RoomLeaderboardEntry[];
+        };
+        const devices = (data.devices ?? []).filter(
+          (d) => d.deviceId !== ensureDeviceId(),
+        );
+        setRoomId(activeRoomId);
+        setShareEnabled(true);
+        setRemoteFeeds(devices);
+        setRoomLeaderboard(data.leaderboard ?? []);
+        startSignalPolling(activeRoomId);
+        await fetch(
+          `/api/rooms/${encodeURIComponent(activeRoomId)}/landmarks`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              deviceId: ensureDeviceId(),
+              username:
+                username.trim().length > 0
+                  ? normalizeUsername(username)
+                  : `User-${ensureDeviceId().slice(-4)}`,
+              reps: 0,
+              updatedAt: Date.now(),
+              poseLandmarks: [],
+              handLandmarks: [],
+            }),
+          },
+        );
+        await sendSignal("join", undefined, undefined, activeRoomId);
+        if (cancelled) return;
+        setRoomJoinState("joined");
+        setRoomProgressText(
+          `Connected to room "${activeRoomId}". Peers online: ${devices.length}.`,
+        );
+      } catch {
+        if (!cancelled) {
+          clearRoomSession();
+        }
+      }
     }
 
-    setRoomJoinState('creating')
-    setRoomProgressText(`Creating room "${normalizedRoomId}"...`)
+    void restoreSession();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  async function createRoom() {
+    const normalizedRoomId = normalizeRoomId(roomId);
+    if (!normalizedRoomId) {
+      setRoomJoinState("error");
+      setRoomProgressText("Enter a room name first.");
+      return;
+    }
+
+    setRoomJoinState("creating");
+    setRoomProgressText(`Creating room "${normalizedRoomId}"...`);
 
     try {
-      const response = await fetch(`/api/rooms/${encodeURIComponent(normalizedRoomId)}/landmarks`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          deviceId: ensureDeviceId(),
-          username:
-            username.trim().length > 0
-              ? normalizeUsername(username)
-              : `User-${ensureDeviceId().slice(-4)}`,
-          reps: repCount,
-          updatedAt: Date.now(),
-          poseLandmarks: [],
-          handLandmarks: [],
-        }),
-      })
+      const response = await fetch(
+        `/api/rooms/${encodeURIComponent(normalizedRoomId)}/landmarks`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            deviceId: ensureDeviceId(),
+            username:
+              username.trim().length > 0
+                ? normalizeUsername(username)
+                : `User-${ensureDeviceId().slice(-4)}`,
+            reps: repCount,
+            updatedAt: Date.now(),
+            poseLandmarks: [],
+            handLandmarks: [],
+          }),
+        },
+      );
 
       if (!response.ok) {
-        throw new Error('Room creation failed')
+        throw new Error("Room creation failed");
       }
 
-      setShareEnabled(true)
-      setRemoteFeeds([])
-      startSignalPolling(normalizedRoomId)
-      await sendSignal('join', undefined, undefined, normalizedRoomId)
-      setRoomJoinState('joined')
-      setRoomProgressText(`Room "${normalizedRoomId}" created. Waiting for peers...`)
+      setShareEnabled(true);
+      setRemoteFeeds([]);
+      setRoomLeaderboard([]);
+      startSignalPolling(normalizedRoomId);
+      await sendSignal("join", undefined, undefined, normalizedRoomId);
+      setRoomJoinState("joined");
+      persistRoomSession(normalizedRoomId);
+      setRoomProgressText(
+        `Room "${normalizedRoomId}" created. Waiting for peers...`,
+      );
     } catch {
-      setRoomJoinState('error')
-      setRoomProgressText('Failed to create room. Please try again.')
+      setRoomJoinState("error");
+      setRoomProgressText("Failed to create room. Please try again.");
     }
   }
 
   async function joinRoom() {
-    const normalizedRoomId = normalizeRoomId(roomId)
+    const normalizedRoomId = normalizeRoomId(roomId);
     if (!normalizedRoomId) {
-      setRoomJoinState('error')
-      setRoomProgressText('Enter a room name first.')
-      return
+      setRoomJoinState("error");
+      setRoomProgressText("Enter a room name first.");
+      return;
     }
 
-    setRoomJoinState('joining')
-    setRoomProgressText(`Joining room "${normalizedRoomId}"...`)
+    setRoomJoinState("joining");
+    setRoomProgressText(`Joining room "${normalizedRoomId}"...`);
 
     try {
-      const response = await fetch(`/api/rooms/${encodeURIComponent(normalizedRoomId)}/landmarks`, {
-        cache: 'no-store',
-      })
+      const response = await fetch(
+        `/api/rooms/${encodeURIComponent(normalizedRoomId)}/landmarks`,
+        {
+          cache: "no-store",
+        },
+      );
       if (!response.ok) {
-        throw new Error('Join room failed')
+        throw new Error("Join room failed");
       }
 
-      await fetch(`/api/rooms/${encodeURIComponent(normalizedRoomId)}/landmarks`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          deviceId: ensureDeviceId(),
-          username:
-            username.trim().length > 0
-              ? normalizeUsername(username)
-              : `User-${ensureDeviceId().slice(-4)}`,
-          reps: repCount,
-          updatedAt: Date.now(),
-          poseLandmarks: [],
-          handLandmarks: [],
-        }),
-      })
+      await fetch(
+        `/api/rooms/${encodeURIComponent(normalizedRoomId)}/landmarks`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            deviceId: ensureDeviceId(),
+            username:
+              username.trim().length > 0
+                ? normalizeUsername(username)
+                : `User-${ensureDeviceId().slice(-4)}`,
+            reps: repCount,
+            updatedAt: Date.now(),
+            poseLandmarks: [],
+            handLandmarks: [],
+          }),
+        },
+      );
 
-      const data = (await response.json()) as { devices?: RemoteDeviceFeed[] }
-      const devices = (data.devices ?? []).filter((d) => d.deviceId !== ensureDeviceId())
+      const data = (await response.json()) as {
+        devices?: RemoteDeviceFeed[];
+        leaderboard?: RoomLeaderboardEntry[];
+      };
+      const devices = (data.devices ?? []).filter(
+        (d) => d.deviceId !== ensureDeviceId(),
+      );
 
-      setShareEnabled(true)
-      setRemoteFeeds(devices)
-      startSignalPolling(normalizedRoomId)
-      await sendSignal('join', undefined, undefined, normalizedRoomId)
-      setRoomJoinState('joined')
+      setShareEnabled(true);
+      setRemoteFeeds(devices);
+      setRoomLeaderboard(data.leaderboard ?? []);
+      startSignalPolling(normalizedRoomId);
+      await sendSignal("join", undefined, undefined, normalizedRoomId);
+      setRoomJoinState("joined");
+      persistRoomSession(normalizedRoomId);
       setRoomProgressText(
         `Joined room "${normalizedRoomId}" successfully. Peers online: ${devices.length}.`,
-      )
+      );
     } catch {
-      setRoomJoinState('error')
-      setRoomProgressText('Failed to join room. Check room name and connection.')
+      setRoomJoinState("error");
+      setRoomProgressText(
+        "Failed to join room. Check room name and connection.",
+      );
     }
   }
 
   function stopTimer() {
     if (timerRef.current !== null) {
-      clearInterval(timerRef.current as NodeJS.Timeout)
-      timerRef.current = null
+      clearInterval(timerRef.current as NodeJS.Timeout);
+      timerRef.current = null;
     }
-    startTimestampRef.current = null
+    startTimestampRef.current = null;
   }
 
   function startTimer() {
-    stopTimer()
-    const start = Date.now()
-    startTimestampRef.current = start
-    setElapsedSeconds(0)
+    stopTimer();
+    const start = Date.now();
+    startTimestampRef.current = start;
+    setElapsedSeconds(0);
     timerRef.current = setInterval(() => {
-      const currentStart = startTimestampRef.current
-      if (!currentStart) return
-      setElapsedSeconds(Math.floor((Date.now() - currentStart) / 1000))
-    }, 1000)
+      const currentStart = startTimestampRef.current;
+      if (!currentStart) return;
+      setElapsedSeconds(Math.floor((Date.now() - currentStart) / 1000));
+    }, 1000);
   }
 
   function stopCamera() {
     if (rafRef.current !== null) {
-      cancelAnimationFrame(rafRef.current)
-      rafRef.current = null
+      cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
     }
     if (streamRef.current) {
-      streamRef.current.getTracks().forEach((track) => track.stop())
-      streamRef.current = null
+      streamRef.current.getTracks().forEach((track) => track.stop());
+      streamRef.current = null;
     }
     if (shareAlertTimerRef.current !== null) {
-      window.clearTimeout(shareAlertTimerRef.current)
-      shareAlertTimerRef.current = null
+      window.clearTimeout(shareAlertTimerRef.current);
+      shareAlertTimerRef.current = null;
     }
     if (presenceTimerRef.current !== null) {
-      window.clearInterval(presenceTimerRef.current)
-      presenceTimerRef.current = null
+      window.clearInterval(presenceTimerRef.current);
+      presenceTimerRef.current = null;
     }
-    setShowShareCameraAlert(false)
-    void sendSignal('leave').catch(() => undefined)
-    stopSignalPolling()
-    closeAllPeers()
-    setRemoteFeeds([])
-    setRemoteMediaFeeds([])
+    setShowShareCameraAlert(false);
+    void sendSignal("leave").catch(() => undefined);
+    stopSignalPolling();
+    closeAllPeers();
+    setRemoteFeeds([]);
+    setRoomLeaderboard([]);
+    setRemoteMediaFeeds([]);
     if (videoRef.current) {
-      videoRef.current.pause()
-      videoRef.current.srcObject = null
+      videoRef.current.pause();
+      videoRef.current.srcObject = null;
     }
-    const canvas = canvasRef.current
+    const canvas = canvasRef.current;
     if (canvas) {
-      const ctx = canvas.getContext('2d')
-      ctx?.clearRect(0, 0, canvas.width, canvas.height)
+      const ctx = canvas.getContext("2d");
+      ctx?.clearRect(0, 0, canvas.width, canvas.height);
     }
-    stopTimer()
-    setIsCameraOn(false)
-    setHandsDetected(0)
-    setStatusText('Camera is off')
-    downFrameCountRef.current = 0
-    upFrameCountRef.current = 0
-    bottomHipYRef.current = null
-    topHipYRef.current = null
-    elbowEmaRef.current = null
-    bodyEmaRef.current = null
-    cycleMinElbowRef.current = null
-    cycleMaxElbowRef.current = null
-    upAngleBaselineRef.current = null
-    downStartedAtRef.current = null
-    lastRepAtRef.current = 0
+    stopTimer();
+    setIsCameraOn(false);
+    setHandsDetected(0);
+    setStatusText("Camera is off");
+    downFrameCountRef.current = 0;
+    upFrameCountRef.current = 0;
+    bottomHipYRef.current = null;
+    topHipYRef.current = null;
+    elbowEmaRef.current = null;
+    bodyEmaRef.current = null;
+    cycleMinElbowRef.current = null;
+    cycleMaxElbowRef.current = null;
+    upAngleBaselineRef.current = null;
+    downStartedAtRef.current = null;
+    lastRepAtRef.current = 0;
   }
 
   useEffect(() => {
-    let cancelled = false
+    let cancelled = false;
     async function initLandmarker() {
       try {
-        const { poseLandmarker, handLandmarker } = await withSuppressedMediapipeInfo(
-          async () => {
+        const { poseLandmarker, handLandmarker } =
+          await withSuppressedMediapipeInfo(async () => {
             const vision = await FilesetResolver.forVisionTasks(WASM_URL);
-            const poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
-              baseOptions: { modelAssetPath: MODEL_URL, delegate: MEDIAPIPE_DELEGATE },
-              runningMode: "VIDEO",
-              numPoses: 1,
-              outputSegmentationMasks: false,
-            });
+            const poseLandmarker = await PoseLandmarker.createFromOptions(
+              vision,
+              {
+                baseOptions: {
+                  modelAssetPath: MODEL_URL,
+                  delegate: MEDIAPIPE_DELEGATE,
+                },
+                runningMode: "VIDEO",
+                numPoses: 1,
+                outputSegmentationMasks: false,
+              },
+            );
 
             let handLandmarker: HandLandmarker;
             try {
@@ -869,53 +1146,64 @@ export function PushupCoach() {
             }
 
             return { poseLandmarker, handLandmarker };
-          },
-        );
+          });
 
         if (cancelled) {
           try {
-            poseLandmarker.close()
-            handLandmarker.close()
+            withSuppressedMediapipeInfo(() => {
+              poseLandmarker.close();
+              handLandmarker.close();
+            });
           } catch {
             // Ignore teardown errors during route transitions.
           }
-          return
+          return;
         }
 
-        poseLandmarkerRef.current = poseLandmarker
-        handLandmarkerRef.current = handLandmarker
-        setStatusText('Models loaded. Ready to start camera.')
+        poseLandmarkerRef.current = poseLandmarker;
+        handLandmarkerRef.current = handLandmarker;
+        setStatusText("Models loaded. Ready to start camera.");
       } catch {
-        setStatusText('Failed to load MediaPipe models.')
+        setStatusText("Failed to load MediaPipe models.");
       }
     }
-    initLandmarker()
+    initLandmarker();
     return () => {
-      cancelled = true
-      stopSignalPolling()
-      closeAllPeers()
+      cancelled = true;
+      stopSignalPolling();
+      closeAllPeers();
       if (presenceTimerRef.current !== null) {
-        window.clearInterval(presenceTimerRef.current)
-        presenceTimerRef.current = null
+        window.clearInterval(presenceTimerRef.current);
+        presenceTimerRef.current = null;
       }
-      stopCamera()
-      poseLandmarkerRef.current?.close()
-      handLandmarkerRef.current?.close()
-    }
-  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+      stopCamera();
+      withSuppressedMediapipeInfo(() => {
+        poseLandmarkerRef.current?.close();
+        handLandmarkerRef.current?.close();
+      });
+    };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  function getSideMetrics(landmarks: Landmark[], side: 'left' | 'right'): SideMetrics {
-    const shoulder = side === 'left' ? landmarks[SHOULDER_L] : landmarks[SHOULDER_R]
-    const elbow = side === 'left' ? landmarks[ELBOW_L] : landmarks[ELBOW_R]
-    const wrist = side === 'left' ? landmarks[WRIST_L] : landmarks[WRIST_R]
-    const hip = side === 'left' ? landmarks[HIP_L] : landmarks[HIP_R]
-    const knee = side === 'left' ? landmarks[KNEE_L] : landmarks[KNEE_R]
-    const ankle = side === 'left' ? landmarks[ANKLE_L] : landmarks[ANKLE_R]
+  function getSideMetrics(
+    landmarks: Landmark[],
+    side: "left" | "right",
+  ): SideMetrics {
+    const shoulder =
+      side === "left" ? landmarks[SHOULDER_L] : landmarks[SHOULDER_R];
+    const elbow = side === "left" ? landmarks[ELBOW_L] : landmarks[ELBOW_R];
+    const wrist = side === "left" ? landmarks[WRIST_L] : landmarks[WRIST_R];
+    const hip = side === "left" ? landmarks[HIP_L] : landmarks[HIP_R];
+    const knee = side === "left" ? landmarks[KNEE_L] : landmarks[KNEE_R];
+    const ankle = side === "left" ? landmarks[ANKLE_L] : landmarks[ANKLE_R];
 
-    const required = [shoulder, elbow, wrist, hip, knee, ankle]
-    const visibleCount = required.filter((lm) => isVisible(lm)).length
-    const quality = visibleCount / required.length
-    const valid = isVisible(shoulder) && isVisible(elbow) && isVisible(wrist) && isVisible(hip)
+    const required = [shoulder, elbow, wrist, hip, knee, ankle];
+    const visibleCount = required.filter((lm) => isVisible(lm)).length;
+    const quality = visibleCount / required.length;
+    const valid =
+      isVisible(shoulder) &&
+      isVisible(elbow) &&
+      isVisible(wrist) &&
+      isVisible(hip);
 
     if (!valid) {
       return {
@@ -926,24 +1214,22 @@ export function PushupCoach() {
         wristShoulderDx: 0,
         quality,
         valid: false,
-      }
+      };
     }
 
     const upperArm = {
       x: elbow!.x - shoulder!.x,
       y: elbow!.y - shoulder!.y,
-    }
+    };
     const torso = {
       x: hip!.x - shoulder!.x,
       y: hip!.y - shoulder!.y,
-    }
+    };
 
     const bodyAngle = isVisible(ankle)
       ? angleABC(shoulder!, hip!, ankle!)
-      : 180
-    const hipAngle = isVisible(knee)
-      ? angleABC(shoulder!, hip!, knee!)
-      : 180
+      : 180;
+    const hipAngle = isVisible(knee) ? angleABC(shoulder!, hip!, knee!) : 180;
 
     return {
       elbowAngle: angleABC(shoulder!, elbow!, wrist!),
@@ -953,222 +1239,263 @@ export function PushupCoach() {
       wristShoulderDx: Math.abs(wrist!.x - shoulder!.x),
       quality,
       valid: true,
-    }
+    };
   }
 
   function analyzePose(landmarks: Landmark[]) {
-    if (!landmarks || landmarks.length < 29) return
+    if (!landmarks || landmarks.length < 29) return;
 
-    const left = getSideMetrics(landmarks, 'left')
-    const right = getSideMetrics(landmarks, 'right')
-    const side = left.quality >= right.quality ? left : right
+    const left = getSideMetrics(landmarks, "left");
+    const right = getSideMetrics(landmarks, "right");
+    const side = left.quality >= right.quality ? left : right;
 
     if (!side.valid) {
-      setStatusText('Low landmark confidence. Keep full body in frame.')
-      setFeedback(['Move slightly farther from the camera and keep side view visible.'])
-      return
+      setStatusText("Low landmark confidence. Keep full body in frame.");
+      setFeedback([
+        "Move slightly farther from the camera and keep side view visible.",
+      ]);
+      return;
     }
 
-    const smoothedElbow = ema(side.elbowAngle, elbowEmaRef.current, ELBOW_ALPHA)
-    const smoothedBody = ema(side.bodyAngle, bodyEmaRef.current, BODY_ALPHA)
-    elbowEmaRef.current = smoothedElbow
-    bodyEmaRef.current = smoothedBody
+    const smoothedElbow = ema(
+      side.elbowAngle,
+      elbowEmaRef.current,
+      ELBOW_ALPHA,
+    );
+    const smoothedBody = ema(side.bodyAngle, bodyEmaRef.current, BODY_ALPHA);
+    elbowEmaRef.current = smoothedElbow;
+    bodyEmaRef.current = smoothedBody;
 
-    if (cycleMinElbowRef.current === null || smoothedElbow < cycleMinElbowRef.current) {
-      cycleMinElbowRef.current = smoothedElbow
+    if (
+      cycleMinElbowRef.current === null ||
+      smoothedElbow < cycleMinElbowRef.current
+    ) {
+      cycleMinElbowRef.current = smoothedElbow;
     }
-    if (cycleMaxElbowRef.current === null || smoothedElbow > cycleMaxElbowRef.current) {
-      cycleMaxElbowRef.current = smoothedElbow
+    if (
+      cycleMaxElbowRef.current === null ||
+      smoothedElbow > cycleMaxElbowRef.current
+    ) {
+      cycleMaxElbowRef.current = smoothedElbow;
     }
 
-    const leftHip = landmarks[HIP_L]
-    const rightHip = landmarks[HIP_R]
-    const leftShoulder = landmarks[SHOULDER_L]
-    const rightShoulder = landmarks[SHOULDER_R]
-    const shoulderWidth = isVisible(leftShoulder) && isVisible(rightShoulder)
-      ? distance2D(leftShoulder!, rightShoulder!)
-      : 0.15
-    const hipY = isVisible(leftHip) && isVisible(rightHip)
-      ? (leftHip!.y + rightHip!.y) / 2
-      : side === left
-        ? (leftHip?.y ?? 0.5)
-        : (rightHip?.y ?? 0.5)
+    const leftHip = landmarks[HIP_L];
+    const rightHip = landmarks[HIP_R];
+    const leftShoulder = landmarks[SHOULDER_L];
+    const rightShoulder = landmarks[SHOULDER_R];
+    const shoulderWidth =
+      isVisible(leftShoulder) && isVisible(rightShoulder)
+        ? distance2D(leftShoulder!, rightShoulder!)
+        : 0.15;
+    const hipY =
+      isVisible(leftHip) && isVisible(rightHip)
+        ? (leftHip!.y + rightHip!.y) / 2
+        : side === left
+          ? (leftHip?.y ?? 0.5)
+          : (rightHip?.y ?? 0.5);
 
-    if (stageRef.current === 'up') {
+    if (stageRef.current === "up") {
       if (topHipYRef.current === null || hipY < topHipYRef.current) {
-        topHipYRef.current = hipY
+        topHipYRef.current = hipY;
       }
       if (smoothedElbow > 140) {
-        upAngleBaselineRef.current = ema(smoothedElbow, upAngleBaselineRef.current, 0.12)
+        upAngleBaselineRef.current = ema(
+          smoothedElbow,
+          upAngleBaselineRef.current,
+          0.12,
+        );
       }
     }
-    if (stageRef.current === 'down') {
+    if (stageRef.current === "down") {
       if (bottomHipYRef.current === null || hipY > bottomHipYRef.current) {
-        bottomHipYRef.current = hipY
+        bottomHipYRef.current = hipY;
       }
     }
 
-    const upThreshold = clamp((upAngleBaselineRef.current ?? MIN_REP_UP_ANGLE) - 8, 142, 170)
-    const downThreshold = clamp(upThreshold - 48, 90, 122)
+    const upThreshold = clamp(
+      (upAngleBaselineRef.current ?? MIN_REP_UP_ANGLE) - 8,
+      142,
+      170,
+    );
+    const downThreshold = clamp(upThreshold - 48, 90, 122);
 
-    const isDownNow = smoothedElbow <= downThreshold
-    const isUpNow = smoothedElbow >= upThreshold
+    const isDownNow = smoothedElbow <= downThreshold;
+    const isUpNow = smoothedElbow >= upThreshold;
 
     if (isDownNow) {
-      downFrameCountRef.current += 1
+      downFrameCountRef.current += 1;
     } else {
-      downFrameCountRef.current = 0
+      downFrameCountRef.current = 0;
     }
 
     if (isUpNow) {
-      upFrameCountRef.current += 1
+      upFrameCountRef.current += 1;
     } else {
-      upFrameCountRef.current = 0
+      upFrameCountRef.current = 0;
     }
 
-    if (stageRef.current === 'up' && downFrameCountRef.current >= MIN_REP_FRAMES) {
-      stageRef.current = 'down'
-      bottomHipYRef.current = hipY
-      downStartedAtRef.current = performance.now()
+    if (
+      stageRef.current === "up" &&
+      downFrameCountRef.current >= MIN_REP_FRAMES
+    ) {
+      stageRef.current = "down";
+      bottomHipYRef.current = hipY;
+      downStartedAtRef.current = performance.now();
     }
 
-    if (stageRef.current === 'down' && upFrameCountRef.current >= MIN_REP_FRAMES) {
-      const topHip = topHipYRef.current ?? hipY
-      const bottomHip = bottomHipYRef.current ?? hipY
-      const depthTravel = bottomHip - topHip
-      const normalizedDepth = shoulderWidth > 0 ? depthTravel / shoulderWidth : 0
+    if (
+      stageRef.current === "down" &&
+      upFrameCountRef.current >= MIN_REP_FRAMES
+    ) {
+      const topHip = topHipYRef.current ?? hipY;
+      const bottomHip = bottomHipYRef.current ?? hipY;
+      const depthTravel = bottomHip - topHip;
+      const normalizedDepth =
+        shoulderWidth > 0 ? depthTravel / shoulderWidth : 0;
       const elbowExcursion =
-        (cycleMaxElbowRef.current ?? smoothedElbow) - (cycleMinElbowRef.current ?? smoothedElbow)
-      const now = performance.now()
-      const downDurationMs = downStartedAtRef.current ? now - downStartedAtRef.current : 0
-      const cooldownPassed = now - lastRepAtRef.current >= REP_COOLDOWN_MS
-      const depthOk = normalizedDepth >= MIN_HIP_HEIGHT_DELTA
-      const excursionOk = elbowExcursion >= MIN_ELBOW_EXCURSION
-      const downHeldEnough = downDurationMs >= 80
+        (cycleMaxElbowRef.current ?? smoothedElbow) -
+        (cycleMinElbowRef.current ?? smoothedElbow);
+      const now = performance.now();
+      const downDurationMs = downStartedAtRef.current
+        ? now - downStartedAtRef.current
+        : 0;
+      const cooldownPassed = now - lastRepAtRef.current >= REP_COOLDOWN_MS;
+      const depthOk = normalizedDepth >= MIN_HIP_HEIGHT_DELTA;
+      const excursionOk = elbowExcursion >= MIN_ELBOW_EXCURSION;
+      const downHeldEnough = downDurationMs >= 80;
 
       if (cooldownPassed && downHeldEnough && (depthOk || excursionOk)) {
-        setRepCount((p) => p + 1)
-        const repNow = Date.now()
-        setRepTimestamps((prev) => [...prev, repNow].slice(-200))
-        lastRepRecordedAtRef.current = repNow
-        lastRepAtRef.current = now
+        setRepCount((p) => p + 1);
+        const repNow = Date.now();
+        setRepTimestamps((prev) => [...prev, repNow].slice(-200));
+        lastRepRecordedAtRef.current = repNow;
+        lastRepAtRef.current = now;
       }
 
-      stageRef.current = 'up'
-      topHipYRef.current = hipY
-      bottomHipYRef.current = null
-      cycleMinElbowRef.current = smoothedElbow
-      cycleMaxElbowRef.current = smoothedElbow
-      downStartedAtRef.current = null
+      stageRef.current = "up";
+      topHipYRef.current = hipY;
+      bottomHipYRef.current = null;
+      cycleMinElbowRef.current = smoothedElbow;
+      cycleMaxElbowRef.current = smoothedElbow;
+      downStartedAtRef.current = null;
     }
 
-    let score = 100
-    const nextFeedback: string[] = []
+    let score = 100;
+    const nextFeedback: string[] = [];
 
-    const bodyDeviation = Math.abs(180 - smoothedBody)
+    const bodyDeviation = Math.abs(180 - smoothedBody);
     if (bodyDeviation > 16) {
-      score -= clamp((bodyDeviation - 16) * 1.7, 0, 35)
-      nextFeedback.push('Keep a straighter plank line from shoulders to ankles.')
+      score -= clamp((bodyDeviation - 16) * 1.7, 0, 35);
+      nextFeedback.push(
+        "Keep a straighter plank line from shoulders to ankles.",
+      );
     }
 
-    const hipDeviation = Math.abs(180 - side.hipAngle)
+    const hipDeviation = Math.abs(180 - side.hipAngle);
     if (hipDeviation > 20) {
-      score -= clamp((hipDeviation - 20) * 1.3, 0, 20)
-      nextFeedback.push('Avoid piking or sagging at the hips.')
+      score -= clamp((hipDeviation - 20) * 1.3, 0, 20);
+      nextFeedback.push("Avoid piking or sagging at the hips.");
     }
 
     if (side.elbowTorsoAngle > 82) {
-      score -= clamp((side.elbowTorsoAngle - 82) * 1.1, 0, 18)
-      nextFeedback.push('Tuck elbows a bit closer to your torso.')
+      score -= clamp((side.elbowTorsoAngle - 82) * 1.1, 0, 18);
+      nextFeedback.push("Tuck elbows a bit closer to your torso.");
     }
 
     if (side.wristShoulderDx < 0.035) {
-      score -= 12
-      nextFeedback.push('Place hands slightly wider for better pressing mechanics.')
+      score -= 12;
+      nextFeedback.push(
+        "Place hands slightly wider for better pressing mechanics.",
+      );
     }
 
-    if (smoothedElbow > 110 && stageRef.current === 'down') {
-      score -= clamp((smoothedElbow - 110) * 0.9, 0, 20)
-      nextFeedback.push('Go deeper at the bottom before pressing up.')
+    if (smoothedElbow > 110 && stageRef.current === "down") {
+      score -= clamp((smoothedElbow - 110) * 0.9, 0, 20);
+      nextFeedback.push("Go deeper at the bottom before pressing up.");
     }
 
     if (nextFeedback.length === 0) {
-      nextFeedback.push('Great rep quality. Keep your tempo controlled.')
+      nextFeedback.push("Great rep quality. Keep your tempo controlled.");
     }
 
-    const finalScore = Math.round(clamp(score, 0, 100))
-    setQualityScore(finalScore)
-    setFeedback(nextFeedback)
+    const finalScore = Math.round(clamp(score, 0, 100));
+    setQualityScore(finalScore);
+    setFeedback(nextFeedback);
     if (performance.now() - lastFormPointAtRef.current >= 1000) {
-      lastFormPointAtRef.current = performance.now()
-      setFormHistory((prev) => [...prev, { ts: Date.now(), score: finalScore }].slice(-120))
+      lastFormPointAtRef.current = performance.now();
+      setFormHistory((prev) =>
+        [...prev, { ts: Date.now(), score: finalScore }].slice(-120),
+      );
     }
 
     if (finalScore >= 85) {
-      setStatusText('Form quality: strong')
+      setStatusText("Form quality: strong");
     } else if (finalScore >= 70) {
-      setStatusText('Form quality: fair')
+      setStatusText("Form quality: fair");
     } else {
-      setStatusText('Form quality: needs improvement')
+      setStatusText("Form quality: needs improvement");
     }
   }
 
   function renderLoop() {
-    const video = videoRef.current
-    const canvas = canvasRef.current
-    const poseLandmarker = poseLandmarkerRef.current
-    const handLandmarker = handLandmarkerRef.current
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    const poseLandmarker = poseLandmarkerRef.current;
+    const handLandmarker = handLandmarkerRef.current;
 
     if (!video || !canvas || !poseLandmarker || !handLandmarker) {
-      return
+      return;
     }
 
-    const ctx = canvas.getContext('2d')
+    const ctx = canvas.getContext("2d");
     if (!ctx || video.videoWidth === 0) {
-      rafRef.current = requestAnimationFrame(renderLoop)
-      return
+      rafRef.current = requestAnimationFrame(renderLoop);
+      return;
     }
 
-    if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
-      canvas.width = video.videoWidth
-      canvas.height = video.videoHeight
+    if (
+      canvas.width !== video.videoWidth ||
+      canvas.height !== video.videoHeight
+    ) {
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
     }
 
     if (video.currentTime === lastVideoTimeRef.current) {
-      rafRef.current = requestAnimationFrame(renderLoop)
-      return
+      rafRef.current = requestAnimationFrame(renderLoop);
+      return;
     }
-    lastVideoTimeRef.current = video.currentTime
+    lastVideoTimeRef.current = video.currentTime;
 
-    const t = performance.now()
-    const pResult = poseLandmarker.detectForVideo(video, t)
-    const hResult = handLandmarker.detectForVideo(video, t)
-    
-    ctx.clearRect(0, 0, canvas.width, canvas.height)
-    const drawingUtils = new DrawingUtils(ctx)
+    const t = performance.now();
+    const pResult = poseLandmarker.detectForVideo(video, t);
+    const hResult = handLandmarker.detectForVideo(video, t);
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    const drawingUtils = new DrawingUtils(ctx);
 
     if (pResult.landmarks && pResult.landmarks.length > 0) {
-      const poses = pResult.landmarks[0]
+      const poses = pResult.landmarks[0];
       // Draw standard inner skeleton with thick high contrast to heavily outline it
       drawingUtils.drawConnectors(poses, PoseLandmarker.POSE_CONNECTIONS, {
-        color: '#00FF00',
+        color: "#00FF00",
         lineWidth: 8,
-      })
+      });
       drawingUtils.drawConnectors(poses, PoseLandmarker.POSE_CONNECTIONS, {
-        color: '#FFFFFF',
+        color: "#FFFFFF",
         lineWidth: 3,
-      })
+      });
       drawingUtils.drawLandmarks(poses, {
-        color: '#FF0000',
+        color: "#FF0000",
         lineWidth: 2,
         radius: 4,
-      })
-      analyzePose(poses)
+      });
+      analyzePose(poses);
 
-      const normalizedRoomId = normalizeRoomId(roomId)
+      const normalizedRoomId = normalizeRoomId(roomId);
       if (shareEnabled && normalizedRoomId) {
         if (t - lastSharePushAtRef.current >= SHARE_PUSH_INTERVAL_MS) {
-          lastSharePushAtRef.current = t
+          lastSharePushAtRef.current = t;
           const payload = {
             deviceId: ensureDeviceId(),
             username:
@@ -1191,102 +1518,115 @@ export function PushupCoach() {
                 visibility: 1,
               })),
             ),
-          }
+          };
 
-          void fetch(`/api/rooms/${encodeURIComponent(normalizedRoomId)}/landmarks`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload),
-          })
+          void fetch(
+            `/api/rooms/${encodeURIComponent(normalizedRoomId)}/landmarks`,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(payload),
+            },
+          );
         }
       }
     }
 
     if (hResult.landmarks && hResult.landmarks.length > 0) {
-      setHandsDetected(hResult.landmarks.length)
+      setHandsDetected(hResult.landmarks.length);
       for (const hand of hResult.landmarks) {
-        const normalized = hand.map(h => ({ ...h, visibility: 1 }))
-        drawingUtils.drawConnectors(normalized, HandLandmarker.HAND_CONNECTIONS, {
-          color: '#00FFFF',
-          lineWidth: 5,
-        })
+        const normalized = hand.map((h) => ({ ...h, visibility: 1 }));
+        drawingUtils.drawConnectors(
+          normalized,
+          HandLandmarker.HAND_CONNECTIONS,
+          {
+            color: "#00FFFF",
+            lineWidth: 5,
+          },
+        );
         drawingUtils.drawLandmarks(normalized, {
-          color: '#FFFF00',
+          color: "#FFFF00",
           lineWidth: 2,
           radius: 3,
-        })
+        });
       }
     }
 
     if (remoteFeedsRef.current.length > 0) {
-      const remoteDrawer = new DrawingUtils(ctx)
+      const remoteDrawer = new DrawingUtils(ctx);
       for (const feed of remoteFeedsRef.current) {
-        const remotePose = normalizeWireLandmarks(feed.poseLandmarks)
+        const remotePose = normalizeWireLandmarks(feed.poseLandmarks);
         if (remotePose.length > 0) {
-          const color = roomColorFromId(feed.deviceId)
-          remoteDrawer.drawConnectors(remotePose, PoseLandmarker.POSE_CONNECTIONS, {
-            color,
-            lineWidth: 2,
-          })
+          const color = roomColorFromId(feed.deviceId);
+          remoteDrawer.drawConnectors(
+            remotePose,
+            PoseLandmarker.POSE_CONNECTIONS,
+            {
+              color,
+              lineWidth: 2,
+            },
+          );
           remoteDrawer.drawLandmarks(remotePose, {
             color,
             lineWidth: 1,
             radius: 2,
-          })
+          });
         }
       }
     }
 
-    rafRef.current = requestAnimationFrame(renderLoop)
+    rafRef.current = requestAnimationFrame(renderLoop);
   }
 
   async function startCamera() {
-    if (!poseLandmarkerRef.current) return
+    if (!poseLandmarkerRef.current) return;
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: 'user' }
-      })
-      streamRef.current = stream
+        video: { facingMode: "user" },
+      });
+      streamRef.current = stream;
       if (videoRef.current) {
-        videoRef.current.srcObject = stream
+        videoRef.current.srcObject = stream;
         // Wait until metadata loads to attach perfect aspect ratio logic immediately
         videoRef.current.onloadedmetadata = async () => {
-          await videoRef.current?.play()
-          downFrameCountRef.current = 0
-          upFrameCountRef.current = 0
-          bottomHipYRef.current = null
-          topHipYRef.current = null
-          elbowEmaRef.current = null
-          bodyEmaRef.current = null
-          cycleMinElbowRef.current = null
-          cycleMaxElbowRef.current = null
-          upAngleBaselineRef.current = null
-          downStartedAtRef.current = null
-          lastRepAtRef.current = 0
-          stageRef.current = 'up'
-          setRepCount(0)
-          setRepTimestamps([])
-          setQualityScore(0)
-          setFormHistory([])
-          setFeedback(['Camera started. Hold side view and begin controlled reps.'])
-          setIsCameraOn(true)
-          setStatusText('Camera active')
-          setShowShareCameraAlert(true)
+          await videoRef.current?.play();
+          downFrameCountRef.current = 0;
+          upFrameCountRef.current = 0;
+          bottomHipYRef.current = null;
+          topHipYRef.current = null;
+          elbowEmaRef.current = null;
+          bodyEmaRef.current = null;
+          cycleMinElbowRef.current = null;
+          cycleMaxElbowRef.current = null;
+          upAngleBaselineRef.current = null;
+          downStartedAtRef.current = null;
+          lastRepAtRef.current = 0;
+          stageRef.current = "up";
+          setRepCount(0);
+          setRepTimestamps([]);
+          setQualityScore(0);
+          setFormHistory([]);
+          setFeedback([
+            "Camera started. Hold side view and begin controlled reps.",
+          ]);
+          setIsCameraOn(true);
+          setStatusText("Camera active");
+          setShowShareCameraAlert(true);
           if (shareAlertTimerRef.current !== null) {
-            window.clearTimeout(shareAlertTimerRef.current)
+            window.clearTimeout(shareAlertTimerRef.current);
           }
           shareAlertTimerRef.current = window.setTimeout(() => {
-            setShowShareCameraAlert(false)
-            shareAlertTimerRef.current = null
-          }, 4000)
-          startTimer()
-          lastVideoTimeRef.current = -1
-          await attachTracksAndRenegotiate()
-          requestAnimationFrame(renderLoop)
-        }
+            setShowShareCameraAlert(false);
+            shareAlertTimerRef.current = null;
+          }, 4000);
+          startTimer();
+          lastVideoTimeRef.current = -1;
+          await attachTracksAndRenegotiate();
+          requestAnimationFrame(renderLoop);
+        };
       }
     } catch {
-      setStatusText('Camera access denied or failed')
+      setStatusText("Camera access denied or failed");
     }
   }
 
@@ -1295,7 +1635,6 @@ export function PushupCoach() {
       <div className="mx-auto flex w-full max-w-7xl flex-col gap-6 p-6">
         <header className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
           <div className="flex flex-col gap-2">
-            <Badge variant="outline">Merged runtime + Convex DB relay</Badge>
             <h1 className="text-3xl font-semibold tracking-tight sm:text-4xl">
               Pushup Coach
             </h1>
@@ -1305,7 +1644,11 @@ export function PushupCoach() {
             <Button onClick={startCamera} disabled={isCameraOn}>
               Start camera
             </Button>
-            <Button onClick={stopCamera} variant="destructive" disabled={!isCameraOn}>
+            <Button
+              onClick={stopCamera}
+              variant="destructive"
+              disabled={!isCameraOn}
+            >
               Stop camera
             </Button>
           </div>
@@ -1359,40 +1702,52 @@ export function PushupCoach() {
 
             <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
               <Card className="bg-muted/25">
-                <CardHeader className="pb-2">
-                  <CardTitle className="text-xs text-muted-foreground">Form score</CardTitle>
+                <CardHeader>
+                  <CardTitle className="text-xs text-muted-foreground">
+                    Form score
+                  </CardTitle>
                 </CardHeader>
                 <CardContent>
                   <p className="text-2xl font-semibold">{qualityScore}</p>
                 </CardContent>
               </Card>
               <Card className="bg-muted/25">
-                <CardHeader className="pb-2">
-                  <CardTitle className="text-xs text-muted-foreground">Reps</CardTitle>
+                <CardHeader>
+                  <CardTitle className="text-xs text-muted-foreground">
+                    Reps
+                  </CardTitle>
                 </CardHeader>
                 <CardContent>
                   <p className="text-2xl font-semibold">{repCount}</p>
                 </CardContent>
               </Card>
               <Card className="bg-muted/25">
-                <CardHeader className="pb-2">
-                  <CardTitle className="text-xs text-muted-foreground">Timer</CardTitle>
+                <CardHeader>
+                  <CardTitle className="text-xs text-muted-foreground">
+                    Timer
+                  </CardTitle>
                 </CardHeader>
                 <CardContent>
-                  <p className="text-2xl font-semibold">{formatDuration(elapsedSeconds)}</p>
+                  <p className="text-2xl font-semibold">
+                    {formatDuration(elapsedSeconds)}
+                  </p>
                 </CardContent>
               </Card>
               <Card className="bg-muted/25">
-                <CardHeader className="pb-2">
-                  <CardTitle className="text-xs text-muted-foreground">Hands</CardTitle>
+                <CardHeader>
+                  <CardTitle className="text-xs text-muted-foreground">
+                    Hands
+                  </CardTitle>
                 </CardHeader>
                 <CardContent>
                   <p className="text-2xl font-semibold">{handsDetected}</p>
                 </CardContent>
               </Card>
               <Card className="bg-muted/25">
-                <CardHeader className="pb-2">
-                  <CardTitle className="text-xs text-muted-foreground">Calories est.</CardTitle>
+                <CardHeader>
+                  <CardTitle className="text-xs text-muted-foreground">
+                    Calories est.
+                  </CardTitle>
                 </CardHeader>
                 <CardContent>
                   <p className="text-2xl font-semibold">{calorieEstimate}</p>
@@ -1402,11 +1757,11 @@ export function PushupCoach() {
 
             <div className="grid gap-4 lg:grid-cols-2">
               <Card>
-                <CardHeader className="pb-2">
+                <CardHeader>
                   <CardTitle className="text-base">Form history</CardTitle>
                 </CardHeader>
                 <CardContent className="flex flex-col gap-3">
-                  <div className="h-36 rounded-lg border bg-muted/25 p-2">
+                  <div className="h-36 rounded-lg border bg-muted/25 p-2 flex flex-col justify-center">
                     {formPoints ? (
                       <svg viewBox="0 0 100 100" className="h-full w-full">
                         <polyline
@@ -1430,14 +1785,17 @@ export function PushupCoach() {
               </Card>
 
               <Card>
-                <CardHeader className="pb-2">
+                <CardHeader>
                   <CardTitle className="text-base">Rep pace</CardTitle>
                 </CardHeader>
                 <CardContent className="flex flex-col gap-3">
                   {repDurations.length > 0 ? (
                     <div className="flex h-36 items-end gap-1 rounded-lg border bg-muted/25 px-2 py-2">
                       {repDurations.map((duration, index) => {
-                        const height = Math.max(12, Math.min(100, duration * 12));
+                        const height = Math.max(
+                          12,
+                          Math.min(100, duration * 12),
+                        );
                         return (
                           <div
                             key={`${duration}-${index}`}
@@ -1464,7 +1822,7 @@ export function PushupCoach() {
 
             {remoteMediaFeeds.length > 0 ? (
               <Card>
-                <CardHeader className="pb-2">
+                <CardHeader>
                   <CardTitle className="text-base">Peer camera feeds</CardTitle>
                 </CardHeader>
                 <CardContent className="grid gap-3 md:grid-cols-2">
@@ -1494,12 +1852,15 @@ export function PushupCoach() {
             ) : null}
 
             <Card>
-              <CardHeader className="pb-2">
+              <CardHeader>
                 <CardTitle className="text-base">Coaching feedback</CardTitle>
               </CardHeader>
               <CardContent className="flex flex-col gap-2">
                 {feedback.map((item, index) => (
-                  <p key={`${item}-${index}`} className="text-sm text-muted-foreground">
+                  <p
+                    key={`${item}-${index}`}
+                    className="text-sm text-muted-foreground"
+                  >
                     {index + 1}. {item}
                   </p>
                 ))}
@@ -1509,7 +1870,7 @@ export function PushupCoach() {
 
           <aside className="flex flex-col gap-4">
             <Card>
-              <CardHeader className="pb-2">
+              <CardHeader>
                 <CardTitle className="text-base">Goal tracker</CardTitle>
               </CardHeader>
               <CardContent className="flex flex-col gap-3">
@@ -1541,45 +1902,53 @@ export function PushupCoach() {
             </Card>
 
             <Card>
-              <CardHeader className="pb-2">
+              <CardHeader>
                 <CardTitle className="text-base">Room relay</CardTitle>
               </CardHeader>
               <CardContent className="flex flex-col gap-3">
+                <p className="text-xs text-muted-foreground">
+                  Signed in as {normalizeUsername(username)}.
+                </p>
                 <FieldGroup>
                   <Field>
-                    <FieldLabel htmlFor="pushup-username">Username</FieldLabel>
-                    <Input
-                      id="pushup-username"
-                      value={username}
-                      maxLength={32}
-                      onChange={(event) => setUsername(event.target.value)}
-                    />
-                  </Field>
-                  <Field>
-                    <FieldLabel htmlFor="pushup-room-name">Room name</FieldLabel>
+                    <FieldLabel htmlFor="pushup-room-name">
+                      Room name
+                    </FieldLabel>
                     <Input
                       id="pushup-room-name"
                       value={roomId}
-                      onChange={(event) => setRoomId(normalizeRoomId(event.target.value))}
+                      onChange={(event) =>
+                        setRoomId(normalizeRoomId(event.target.value))
+                      }
                     />
                   </Field>
                 </FieldGroup>
                 <div className="flex flex-wrap gap-2">
                   <Button
                     onClick={createRoom}
-                    disabled={roomJoinState === "creating" || roomJoinState === "joining"}
+                    disabled={
+                      roomJoinState === "creating" ||
+                      roomJoinState === "joining"
+                    }
                   >
-                    {roomJoinState === "creating" ? "Creating..." : "Create room"}
+                    {roomJoinState === "creating"
+                      ? "Creating..."
+                      : "Create room"}
                   </Button>
                   <Button
                     variant="outline"
                     onClick={joinRoom}
-                    disabled={roomJoinState === "creating" || roomJoinState === "joining"}
+                    disabled={
+                      roomJoinState === "creating" ||
+                      roomJoinState === "joining"
+                    }
                   >
                     {roomJoinState === "joining" ? "Joining..." : "Join room"}
                   </Button>
                 </div>
-                <p className="text-xs text-muted-foreground">{roomProgressText}</p>
+                <p className="text-xs text-muted-foreground">
+                  {roomProgressText}
+                </p>
                 <p className="text-xs text-muted-foreground">
                   Device ID: {ensureDeviceId()}
                 </p>
@@ -1587,7 +1956,7 @@ export function PushupCoach() {
             </Card>
 
             <Card>
-              <CardHeader className="pb-2">
+              <CardHeader>
                 <CardTitle className="text-base">Session patterns</CardTitle>
               </CardHeader>
               <CardContent className="flex flex-col gap-2">

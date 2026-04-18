@@ -1,8 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
+import { auth, currentUser } from "@clerk/nextjs/server";
 
 import {
   normalizeDeviceId,
   normalizeRoomId,
+  normalizeUsername,
   SIGNAL_TYPES,
   type SignalMessage,
   type SignalType,
@@ -49,6 +51,12 @@ function safeParsePayload(value: string | null): unknown {
 function toSignalType(value: unknown): SignalType | null {
   if (typeof value !== "string") return null;
   return SIGNAL_TYPES.includes(value as SignalType) ? (value as SignalType) : null;
+}
+
+function deriveClerkDisplayName(user: Awaited<ReturnType<typeof currentUser>>): string | undefined {
+  if (!user) return undefined;
+  const emailLocalPart = user.primaryEmailAddress?.emailAddress?.split("@")[0];
+  return user.fullName ?? user.username ?? emailLocalPart;
 }
 
 export async function GET(
@@ -149,6 +157,14 @@ export async function POST(
       { status: 400 },
     );
   }
+  const { userId } = await auth();
+  const user = userId ? await currentUser().catch(() => null) : null;
+  const username = normalizeUsername(
+    deriveClerkDisplayName(user) ??
+      (typeof source.username === "string" ? source.username : undefined),
+  );
+  const finalRepsRaw = Number(source.finalReps);
+  const finalReps = Number.isFinite(finalRepsRaw) ? finalRepsRaw : 0;
 
   let payloadJson: string | null = null;
   if (source.payload !== undefined) {
@@ -175,10 +191,34 @@ export async function POST(
     );
 
     if (type === "leave") {
-      await mutateConvex<{ ok: boolean }>("pushupRooms:removeDevice", {
-        roomId: normalizedRoomId,
-        deviceId: fromDeviceId,
-      });
+      try {
+        await mutateConvex<{ ok: boolean }>("pushupRooms:removeDevice", {
+          roomId: normalizedRoomId,
+          deviceId: fromDeviceId,
+        });
+      } catch {}
+      if (userId) {
+        try {
+          await mutateConvex<{ ok: boolean }>("pushupRooms:endSession", {
+            roomId: normalizedRoomId,
+            deviceId: fromDeviceId,
+            userId,
+            username,
+            finalReps,
+          });
+        } catch {}
+      }
+    }
+    if (type === "join" && userId) {
+      try {
+        await mutateConvex<{ ok: boolean }>("pushupRooms:startSession", {
+          roomId: normalizedRoomId,
+          deviceId: fromDeviceId,
+          userId,
+          username,
+          initialReps: finalReps,
+        });
+      } catch {}
     }
 
     return NextResponse.json({ ok: posted.ok, relay: "convex", id: posted.id });
