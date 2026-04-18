@@ -9,6 +9,13 @@ const stepValidator = v.object({
   completedAt: v.union(v.number(), v.null()),
 });
 
+const wireLandmarkValidator = v.object({
+  x: v.number(),
+  y: v.number(),
+  z: v.number(),
+  visibility: v.union(v.number(), v.null()),
+});
+
 export default defineSchema({
   sessions: defineTable({
     userTokenIdentifier: v.string(),
@@ -48,4 +55,32 @@ export default defineSchema({
     focusMinutes: v.number(),
     updatedAt: v.number(),
   }).index("by_userTokenIdentifier_and_dayKey", ["userTokenIdentifier", "dayKey"]),
+  pushupRoomDevices: defineTable({
+    roomId: v.string(),
+    deviceId: v.string(),
+    username: v.string(),
+    reps: v.number(),
+    updatedAt: v.number(),
+    poseLandmarks: v.array(wireLandmarkValidator),
+    handLandmarks: v.array(v.array(wireLandmarkValidator)),
+  })
+    .index("by_roomId_and_updatedAt", ["roomId", "updatedAt"])
+    .index("by_roomId_and_deviceId", ["roomId", "deviceId"]),
+  pushupSignals: defineTable({
+    roomId: v.string(),
+    signalId: v.number(),
+    fromDeviceId: v.string(),
+    toDeviceId: v.union(v.string(), v.null()),
+    type: v.union(
+      v.literal("join"),
+      v.literal("leave"),
+      v.literal("offer"),
+      v.literal("answer"),
+      v.literal("ice"),
+    ),
+    payloadJson: v.union(v.string(), v.null()),
+    createdAt: v.number(),
+  })
+    .index("by_roomId_and_signalId", ["roomId", "signalId"])
+    .index("by_roomId_and_createdAt", ["roomId", "createdAt"]),
 });

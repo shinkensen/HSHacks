@@ -86,6 +86,7 @@ function AppSidebarLeft({
   const router = useRouter();
 
   const navItems = [
+    { label: "Pushup Coach", href: "/pushups" },
     { label: "Goal Input", href: "/input" },
     { label: "Focus", href: "/focus" },
     { label: "Summary", href: "/summary" },
@@ -98,7 +99,7 @@ function AppSidebarLeft({
           <SidebarMenuItem>
             <div className="flex items-center gap-2 rounded-md bg-background/80 px-2 py-2">
               {isUserLoaded && userEmail ? (
-                <UserButton afterSignOutUrl="/" />
+                <UserButton />
               ) : (
                 <div className="size-7 shrink-0 rounded-full bg-muted" />
               )}
@@ -168,6 +169,11 @@ function AppSidebarLeft({
       </SidebarContent>
       <SidebarFooter>
         <SidebarMenu>
+          <SidebarMenuItem>
+            <SidebarMenuButton onClick={() => router.push("/pushups")}>
+              Open pushup coach
+            </SidebarMenuButton>
+          </SidebarMenuItem>
           <SidebarMenuItem>
             <SidebarMenuButton onClick={() => router.push("/input")}>
               Start new session
