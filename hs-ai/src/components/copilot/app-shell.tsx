@@ -325,20 +325,6 @@ function InsightsSidebarBody({
     [trendSeries],
   );
 
-  const heatMapStartDate = useMemo(() => {
-    const start = new Date();
-    start.setHours(0, 0, 0, 0);
-    // Shorter range so cells are readable in the right rail.
-    start.setDate(start.getDate() - 120);
-    return start;
-  }, []);
-
-  const heatMapEndDate = useMemo(() => {
-    const end = new Date();
-    end.setHours(23, 59, 59, 999);
-    return end;
-  }, []);
-
   const heatMapValues = useMemo(
     () =>
       Array.from(heatMapActivityByDay.entries()).map(([dayKey, count]) => ({
@@ -347,6 +333,17 @@ function InsightsSidebarBody({
       })),
     [heatMapActivityByDay],
   );
+
+  const heatMapStartDate = useMemo(() => {
+    if (heatMapValues.length > 0) {
+      const sorted = [...heatMapValues].sort((a, b) => a.date.localeCompare(b.date));
+      return new Date(sorted[0].date);
+    }
+    const start = new Date();
+    start.setHours(0, 0, 0, 0);
+    start.setDate(start.getDate() - 120);
+    return start;
+  }, [heatMapValues]);
 
   return (
     <>
@@ -397,18 +394,13 @@ function InsightsSidebarBody({
               <ActivityHeatMap
                 value={heatMapValues}
                 startDate={heatMapStartDate}
-                endDate={heatMapEndDate}
-                rectSize={10}
+                width={252}
+                rectSize={9}
                 space={2}
                 legendCellSize={0}
-                weekLabels={["", "", "", "", "", "", ""]}
+                weekLabels={["Sun", "", "Tue", "", "Thu", "", "Sat"]}
                 panelColors={["#e5e7eb", "#bbf7d0", "#86efac", "#22c55e", "#16a34a"]}
-                style={{
-                  width: "100%",
-                  display: "block",
-                  color: "#16a34a",
-                  "--rhm-rect": "#e5e7eb",
-                } as React.CSSProperties}
+                style={{ color: "#16a34a" }}
               />
             </div>
             <p className="px-1 pt-1 text-[11px] text-muted-foreground">
