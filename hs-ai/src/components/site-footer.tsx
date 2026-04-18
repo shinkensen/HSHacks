@@ -10,9 +10,6 @@ export function SiteFooter() {
   return (
     <footer className="border-t border-border/70 py-10">
       <div className="mx-auto w-full max-w-5xl px-6 sm:px-8">
-        <Link href="/" className="mx-auto block w-fit text-sm font-medium tracking-tight">
-          hs-ai
-        </Link>
         <div className="my-6 flex flex-wrap items-center justify-center gap-6 text-sm">
           {FOOTER_LINKS.map((link) => (
             <a

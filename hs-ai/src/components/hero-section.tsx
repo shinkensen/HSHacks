@@ -2,7 +2,8 @@
 
 import Link from "next/link";
 
-import { Button } from "@/components/ui/button";
+import { buttonVariants } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
 
 export default function HeroSection() {
   return (
@@ -18,17 +19,18 @@ export default function HeroSection() {
         </p>
 
         <div className="mt-8 flex flex-wrap items-center justify-center gap-3">
-          <Button size="lg" render={<Link href="/input" />} nativeButton={false}>
+          <Link
+            href="/input"
+            className={cn(buttonVariants({ size: "lg" }))}
+          >
             Start focus session
-          </Button>
-          <Button
-            size="lg"
-            variant="outline"
-            render={<Link href="/summary" />}
-            nativeButton={false}
+          </Link>
+          <Link
+            href="/summary"
+            className={cn(buttonVariants({ size: "lg", variant: "outline" }))}
           >
             Resume previous summary
-          </Button>
+          </Link>
         </div>
       </div>
     </section>
