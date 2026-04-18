@@ -14,6 +14,13 @@ import {
   HandLandmarker,
   PoseLandmarker,
 } from "@mediapipe/tasks-vision";
+import type {
+  IAgoraRTCClient,
+  IAgoraRTCRemoteUser,
+  IMicrophoneAudioTrack,
+  IRemoteAudioTrack,
+  UID,
+} from "agora-rtc-sdk-ng";
 
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -103,13 +110,16 @@ const STRONG_EXCURSION_BONUS = 18;
 const MOTION_SAMPLE_INTERVAL_MS = 400;
 const MAX_MOTION_SAMPLES = 360;
 const SHARE_PUSH_INTERVAL_MS = 100;
-const SHARE_PULL_INTERVAL_MS = 180;
-const SIGNAL_PULL_INTERVAL_MS = 300;
+const SHARE_PULL_INTERVAL_MS = 320;
+const SIGNAL_PULL_INTERVAL_MS = 450;
 const LEADERBOARD_PUSH_THROTTLE_MS = 120;
 const PRESENCE_HEARTBEAT_MS = 2000;
+const PEER_DISCONNECT_GRACE_MS = 6000;
+const SIGNAL_REANNOUNCE_MS = 12_000;
 const DEVICE_ID_STORAGE_KEY = "pushup-room-device-id";
 const SESSION_ROOM_KEY = "pushup-room-session";
 const ROOM_BEST_REPS_KEY = "pushup-room-best-reps";
+const LEADERBOARD_STICKY_MS = 60_000;
 
 function readStoredRoomSession(): string | null {
   if (typeof window === "undefined") return null;
@@ -239,6 +249,94 @@ function randomId() {
   return Math.random().toString(36).slice(2, 10);
 }
 
+function localDayKeyFromTimestamp(timestamp: number): string {
+  const date = new Date(timestamp);
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function voiceLog(event: string, details?: unknown) {
+  if (details === undefined) {
+    console.log(`[voice] ${event}`);
+    return;
+  }
+  console.log(`[voice] ${event}`, details);
+}
+
+function voiceWarn(event: string, details?: unknown) {
+  if (details === undefined) {
+    console.warn(`[voice] ${event}`);
+    return;
+  }
+  console.warn(`[voice] ${event}`, details);
+}
+
+function voiceError(event: string, details?: unknown) {
+  if (details === undefined) {
+    console.error(`[voice] ${event}`);
+    return;
+  }
+  console.error(`[voice] ${event}`, details);
+}
+
+function coachLog(event: string, details?: unknown) {
+  if (details === undefined) {
+    console.log(`[coach] ${event}`);
+    return;
+  }
+  console.log(`[coach] ${event}`, details);
+}
+
+function coachError(event: string, details?: unknown) {
+  if (details === undefined) {
+    console.error(`[coach] ${event}`);
+    return;
+  }
+  console.error(`[coach] ${event}`, details);
+}
+
+function formatAgoraError(error: unknown) {
+  if (!error || typeof error !== "object") {
+    return {
+      code: null as string | number | null,
+      message: "Unknown error",
+      reason: "",
+    };
+  }
+
+  const raw = error as {
+    code?: string | number;
+    message?: string;
+    reason?: string;
+    data?: { code?: string | number; message?: string; reason?: string };
+  };
+
+  const code = raw.code ?? raw.data?.code ?? null;
+  const message = raw.message ?? raw.data?.message ?? "Unknown Agora error";
+  const reason = raw.reason ?? raw.data?.reason ?? "";
+  return { code, message, reason };
+}
+
+function getLeaderboardEntryKey(entry: RoomLeaderboardEntry): string {
+  const userId = entry.userId?.trim() ?? "";
+  if (userId && !userId.startsWith("dev-")) {
+    return `user:${userId}`;
+  }
+  return `name:${normalizeUsername(entry.username).toLowerCase()}`;
+}
+
+function sortLeaderboardEntries<T extends { username: string; reps: number }>(
+  entries: T[],
+): T[] {
+  return [...entries].sort(
+    (a, b) =>
+      b.reps - a.reps ||
+      a.username.localeCompare(b.username, undefined, { sensitivity: "base" }),
+  );
+}
+
 function withSuppressedMediapipeInfo<T>(fn: () => T): T {
   const originalError = console.error;
   const originalWarn = console.warn;
@@ -359,6 +457,15 @@ export function PushupCoach() {
   const [summaryCapturedAt, setSummaryCapturedAt] = useState<number | null>(
     null,
   );
+  const [agoraConnected, setAgoraConnected] = useState(false);
+  const [agoraPeerIds, setAgoraPeerIds] = useState<string[]>([]);
+  const [isMicMuted, setIsMicMuted] = useState(false);
+  const [isSpeakerMuted, setIsSpeakerMuted] = useState(false);
+  const [micTestState, setMicTestState] = useState<
+    "idle" | "testing" | "error"
+  >("idle");
+  const [micTestLevel, setMicTestLevel] = useState(0);
+  const [micTestMessage, setMicTestMessage] = useState("Mic test is off.");
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -389,9 +496,20 @@ export function PushupCoach() {
   const remoteFeedsRef = useRef<RemoteDeviceFeed[]>([]);
   const remoteMediaFeedsRef = useRef<RemoteMediaFeed[]>([]);
   const signalPollTimerRef = useRef<number | null>(null);
+  const signalReannounceTimerRef = useRef<number | null>(null);
   const presenceTimerRef = useRef<number | null>(null);
   const signalCursorRef = useRef(0);
   const peerConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
+  const peerRecoveryTimersRef = useRef<Map<string, number>>(new Map());
+  const agoraClientRef = useRef<IAgoraRTCClient | null>(null);
+  const localMicTrackRef = useRef<IMicrophoneAudioTrack | null>(null);
+  const remoteAgoraTracksRef = useRef<Map<string, IRemoteAudioTrack>>(new Map());
+  const remoteVideoRefs = useRef<Map<string, HTMLVideoElement>>(new Map());
+  const micTestStreamRef = useRef<MediaStream | null>(null);
+  const micTestAudioContextRef = useRef<AudioContext | null>(null);
+  const micTestAnalyserRef = useRef<AnalyserNode | null>(null);
+  const micTestRafRef = useRef<number | null>(null);
+  const micTestUsesCameraStreamRef = useRef(false);
   const shareAlertTimerRef = useRef<number | null>(null);
   const lastFormPointAtRef = useRef(0);
   const lastRepRecordedAtRef = useRef<number | null>(null);
@@ -454,6 +572,47 @@ export function PushupCoach() {
     };
   }
 
+  function mergeRoomLeaderboard(
+    incoming: RoomLeaderboardEntry[] | undefined,
+    keepPreviousWhenEmpty = true,
+  ) {
+    const now = Date.now();
+    setRoomLeaderboard((previous) => {
+      const nextIncoming = (incoming ?? []).filter(
+        (entry) =>
+          entry &&
+          typeof entry.username === "string" &&
+          Number.isFinite(entry.reps),
+      );
+
+      if (nextIncoming.length === 0 && keepPreviousWhenEmpty) {
+        return previous;
+      }
+
+      const byKey = new Map<string, RoomLeaderboardEntry>();
+
+      for (const prev of previous) {
+        if (now - (prev.updatedAt ?? 0) > LEADERBOARD_STICKY_MS) continue;
+        byKey.set(getLeaderboardEntryKey(prev), prev);
+      }
+
+      for (const row of nextIncoming) {
+        const key = getLeaderboardEntryKey(row);
+        const prev = byKey.get(key);
+        const normalizedReps = clamp(Math.floor(row.reps), 0, 100_000);
+        byKey.set(key, {
+          userId: row.userId,
+          username: normalizeUsername(row.username),
+          reps: Math.max(prev?.reps ?? 0, normalizedReps),
+          updatedAt: Math.max(prev?.updatedAt ?? 0, row.updatedAt ?? now),
+        });
+      }
+
+      const merged = Array.from(byKey.values()).slice(0, 24);
+      return sortLeaderboardEntries(merged);
+    });
+  }
+
   const normalizedRoomIdForBest = useMemo(
     () => normalizeRoomId(roomId),
     [roomId],
@@ -465,10 +624,27 @@ export function PushupCoach() {
     () => 0,
   );
 
+  const selfRoomLeaderboardReps = useMemo(() => {
+    const me = (profileUsername || username).trim();
+    if (!me) return 0;
+    const row = roomLeaderboard.find((entry) => entry.username === me);
+    return row?.reps ?? 0;
+  }, [profileUsername, roomLeaderboard, username]);
+
+  const effectiveReps = useMemo(
+    () => Math.max(repCount, storedRoomBestReps, selfRoomLeaderboardReps),
+    [repCount, selfRoomLeaderboardReps, storedRoomBestReps],
+  );
+
   async function pushRoomPresence() {
     const normalizedRoomId = normalizeRoomId(roomId);
     if (!shareEnabled || !normalizedRoomId) return;
     const payload = getRoomPayload();
+    coachLog("pushRoomPresence", {
+      roomId: normalizedRoomId,
+      reps: payload.reps,
+      username: payload.username,
+    });
     await fetch(
       `/api/rooms/${encodeURIComponent(normalizedRoomId)}/landmarks`,
       {
@@ -486,24 +662,21 @@ export function PushupCoach() {
   const leaderboard = useMemo(() => {
     if (roomLeaderboard.length > 0) {
       const me = profileUsername || username;
-      return roomLeaderboard
+      return sortLeaderboardEntries(roomLeaderboard)
         .map((entry) => {
           const isSelf = entry.username === me;
           return {
             deviceId: entry.userId,
             username: entry.username,
-            reps: isSelf
-              ? Math.max(entry.reps, repCount, storedRoomBestReps)
-              : entry.reps,
+            reps: isSelf ? Math.max(entry.reps, effectiveReps) : entry.reps,
             isSelf,
           };
         })
-        .sort((a, b) => b.reps - a.reps)
         .slice(0, 10);
     }
 
-    const selfReps = Math.max(repCount, storedRoomBestReps);
-    return [
+    const selfReps = effectiveReps;
+    return sortLeaderboardEntries([
       {
         deviceId: ensureDeviceId(),
         username: username.trim() || "You",
@@ -516,17 +689,8 @@ export function PushupCoach() {
         reps: Number.isFinite(feed.reps) ? feed.reps : 0,
         isSelf: false,
       })),
-    ]
-      .sort((a, b) => b.reps - a.reps)
-      .slice(0, 10);
-  }, [
-    profileUsername,
-    storedRoomBestReps,
-    remoteFeeds,
-    repCount,
-    roomLeaderboard,
-    username,
-  ]);
+    ]).slice(0, 10);
+  }, [effectiveReps, profileUsername, remoteFeeds, roomLeaderboard, username]);
 
   useEffect(() => {
     const id = normalizeRoomId(roomId);
@@ -563,7 +727,18 @@ export function PushupCoach() {
     return durations.slice(-12);
   }, [repTimestamps]);
 
-  const chartSamples = useMemo(() => motionSamples.slice(-120), [motionSamples]);
+  const repPaceScaleMax = useMemo(() => {
+    const maxDuration = repDurations.reduce(
+      (max, value) => Math.max(max, value),
+      0,
+    );
+    return Math.max(2, Math.ceil(maxDuration));
+  }, [repDurations]);
+
+  const chartSamples = useMemo(
+    () => motionSamples.slice(-120),
+    [motionSamples],
+  );
 
   const elbowSeries = useMemo(
     () => chartSamples.map((sample) => sample.elbowAngle),
@@ -580,7 +755,8 @@ export function PushupCoach() {
       chartSamples.map((sample) =>
         Number(
           (
-            Math.max(sample.normalizedDepth, sample.normalizedShoulderDepth) * 100
+            Math.max(sample.normalizedDepth, sample.normalizedShoulderDepth) *
+            100
           ).toFixed(2),
         ),
       ),
@@ -598,11 +774,6 @@ export function PushupCoach() {
     const total = repDurations.reduce((sum, value) => sum + value, 0);
     return Number((total / repDurations.length).toFixed(2));
   }, [repDurations]);
-
-  const repPaceMax = useMemo(
-    () => Math.max(4, ...repDurations.map((value) => Number(value.toFixed(2)))),
-    [repDurations],
-  );
 
   function buildFallbackSummary() {
     const fastest = repDurations.length > 0 ? Math.min(...repDurations) : 0;
@@ -665,6 +836,32 @@ export function PushupCoach() {
   }, [remoteMediaFeeds]);
 
   useEffect(() => {
+    if (!isSpeakerMuted && remoteMediaFeeds.length > 0) {
+      void ensureRemotePlayback();
+    }
+  }, [isSpeakerMuted, remoteMediaFeeds]);
+
+  useEffect(() => {
+    const normalizedRoomId = normalizeRoomId(roomId);
+    voiceLog("voice auto-join effect", {
+      roomId,
+      normalizedRoomId,
+      shareEnabled,
+      roomJoinState,
+      hasAgoraClient: !!agoraClientRef.current,
+    });
+    if (!shareEnabled || !normalizedRoomId || roomJoinState !== "joined") {
+      if (agoraClientRef.current) {
+        voiceLog("voice auto-join effect: leaving agora due to inactive room/join state");
+        void leaveAgoraVoice();
+      }
+      return;
+    }
+    voiceLog("voice auto-join effect: joining agora");
+    void joinAgoraVoice(normalizedRoomId);
+  }, [roomId, roomJoinState, shareEnabled]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
     const normalizedRoomId = normalizeRoomId(roomId);
     if (!shareEnabled || !normalizedRoomId) {
       return;
@@ -676,6 +873,11 @@ export function PushupCoach() {
     }
     lastLeaderboardPushAtRef.current = now;
 
+    coachLog("leaderboard heartbeat push", {
+      roomId: normalizedRoomId,
+      repCount,
+      username,
+    });
     void fetch(`/api/rooms/${encodeURIComponent(normalizedRoomId)}/landmarks`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -703,11 +905,20 @@ export function PushupCoach() {
 
     async function pullRoomFeeds() {
       try {
+        coachLog("pullRoomFeeds:start", {
+          roomId: normalizedRoomId,
+          roomJoinState,
+        });
         const response = await fetch(
           `/api/rooms/${encodeURIComponent(normalizedRoomId)}/landmarks`,
           { cache: "no-store" },
         );
         if (!response.ok || stopped) {
+          coachLog("pullRoomFeeds:skip", {
+            ok: response.ok,
+            stopped,
+            status: response.status,
+          });
           return;
         }
         const data = (await response.json()) as {
@@ -718,17 +929,20 @@ export function PushupCoach() {
           (d) => d.deviceId !== ensureDeviceId(),
         );
         setRemoteFeeds(devices);
-        setRoomLeaderboard(data.leaderboard ?? []);
+        mergeRoomLeaderboard(data.leaderboard, true);
+        coachLog("pullRoomFeeds:success", {
+          devices: devices.length,
+          leaderboard: data.leaderboard?.length ?? 0,
+        });
         if (roomJoinState === "joined") {
           setRoomProgressText(
             `Connected to room "${normalizedRoomId}". Peers online: ${devices.length}.`,
           );
         }
-      } catch {
+      } catch (error) {
+        coachError("pullRoomFeeds:error", error);
         if (!stopped) {
-          setStatusText(
-            "Room relay unreachable. Verify server/network connection.",
-          );
+          setStatusText("Room unreachable. Verify server/network connection.");
           setRoomJoinState("error");
           setRoomProgressText("Room connection lost. Retrying...");
         }
@@ -747,6 +961,11 @@ export function PushupCoach() {
   useEffect(() => {
     const normalizedRoomId = normalizeRoomId(roomId);
     if (!shareEnabled || !normalizedRoomId) {
+      coachLog("presence effect disabled", {
+        shareEnabled,
+        roomId,
+        normalizedRoomId,
+      });
       if (presenceTimerRef.current !== null) {
         window.clearInterval(presenceTimerRef.current);
         presenceTimerRef.current = null;
@@ -754,12 +973,19 @@ export function PushupCoach() {
       return;
     }
 
+    coachLog("presence effect start", {
+      roomId: normalizedRoomId,
+      intervalMs: PRESENCE_HEARTBEAT_MS,
+    });
     void pushRoomPresence();
     presenceTimerRef.current = window.setInterval(() => {
       void pushRoomPresence();
     }, PRESENCE_HEARTBEAT_MS);
 
     return () => {
+      coachLog("presence effect cleanup", {
+        roomId: normalizedRoomId,
+      });
       if (presenceTimerRef.current !== null) {
         window.clearInterval(presenceTimerRef.current);
         presenceTimerRef.current = null;
@@ -772,6 +998,10 @@ export function PushupCoach() {
   }
 
   function upsertRemoteMedia(deviceId: string, stream: MediaStream) {
+    coachLog("upsertRemoteMedia", {
+      deviceId,
+      streamTrackCount: stream.getTracks().length,
+    });
     setRemoteMediaFeeds((prev) => {
       const existingIndex = prev.findIndex(
         (item) => item.deviceId === deviceId,
@@ -786,6 +1016,7 @@ export function PushupCoach() {
   }
 
   function removeRemoteMedia(deviceId: string) {
+    coachLog("removeRemoteMedia", { deviceId });
     setRemoteMediaFeeds((prev) =>
       prev.filter((item) => item.deviceId !== deviceId),
     );
@@ -799,6 +1030,14 @@ export function PushupCoach() {
   ) {
     const normalizedRoomId = normalizeRoomId(overrideRoomId ?? roomId);
     if (!normalizedRoomId) return;
+    const now = Date.now();
+
+    voiceLog("sendSignal", {
+      type,
+      roomId: normalizedRoomId,
+      toDeviceId: toDeviceId ?? null,
+      hasPayload: payload !== undefined,
+    });
 
     await fetch(`/api/rooms/${encodeURIComponent(normalizedRoomId)}/signals`, {
       method: "POST",
@@ -810,11 +1049,358 @@ export function PushupCoach() {
         payload,
         username: normalizeUsername(username),
         finalReps: repCount,
+        clientDayKey: localDayKeyFromTimestamp(now),
       }),
     });
   }
 
+  function setRemoteVideoRef(deviceId: string, node: HTMLVideoElement | null) {
+    if (node) {
+      remoteVideoRefs.current.set(deviceId, node);
+      return;
+    }
+    remoteVideoRefs.current.delete(deviceId);
+  }
+
+  async function ensureRemotePlayback(deviceId?: string) {
+    if (isSpeakerMuted) return;
+    const nodes = deviceId
+      ? [remoteVideoRefs.current.get(deviceId)].filter(
+          (node): node is HTMLVideoElement => !!node,
+        )
+      : Array.from(remoteVideoRefs.current.values());
+
+    voiceLog("ensureRemotePlayback", {
+      target: deviceId ?? "all",
+      nodeCount: nodes.length,
+    });
+
+    await Promise.all(
+      nodes.map(async (node) => {
+        node.muted = false;
+        try {
+          await node.play();
+          voiceLog("remote video playback started");
+        } catch {
+          // Browser autoplay restrictions can block initial playback; retry on next user gesture.
+          voiceWarn("remote video playback blocked by browser autoplay policy");
+        }
+      }),
+    );
+  }
+
+  useEffect(() => {
+    const stream = streamRef.current;
+    if (stream) {
+      for (const track of stream.getAudioTracks()) {
+        track.enabled = !isMicMuted;
+      }
+    }
+
+    const localVoiceTrack = localMicTrackRef.current;
+    if (localVoiceTrack) {
+      void localVoiceTrack.setEnabled(!isMicMuted);
+    }
+  }, [isMicMuted]);
+
+  async function leaveAgoraVoice() {
+    voiceLog("leaveAgoraVoice:start");
+    const localTrack = localMicTrackRef.current;
+    if (localTrack) {
+      voiceLog("leaveAgoraVoice:stopping local mic track");
+      localTrack.stop();
+      localTrack.close();
+      localMicTrackRef.current = null;
+    }
+
+    voiceLog("leaveAgoraVoice:stopping remote tracks", {
+      remoteTrackCount: remoteAgoraTracksRef.current.size,
+    });
+    for (const track of remoteAgoraTracksRef.current.values()) {
+      track.stop();
+    }
+    remoteAgoraTracksRef.current.clear();
+    setAgoraPeerIds([]);
+
+    const client = agoraClientRef.current;
+    if (client) {
+      voiceLog("leaveAgoraVoice:leaving agora client");
+      client.removeAllListeners();
+      try {
+        await client.leave();
+      } catch {
+        // ignore leave errors while shutting down
+        voiceWarn("leaveAgoraVoice:agora leave threw");
+      }
+    }
+    agoraClientRef.current = null;
+    setAgoraConnected(false);
+    voiceLog("leaveAgoraVoice:done");
+  }
+
+  async function joinAgoraVoice(targetRoomId: string) {
+    voiceLog("joinAgoraVoice:attempt", {
+      targetRoomId,
+      alreadyJoined: !!agoraClientRef.current,
+    });
+    if (agoraClientRef.current) {
+      voiceLog("joinAgoraVoice:skip already joined");
+      return;
+    }
+
+    const appId = (
+      process.env.NEXT_PUBLIC_AGORA_APP_ID?.trim() ||
+      process.env.NEXT_PUBLIC_AGORA_APPID?.trim() ||
+      process.env.AGORA_APP_ID?.trim() ||
+      ""
+    );
+    if (!appId) {
+      voiceError("joinAgoraVoice:missing NEXT_PUBLIC_AGORA_APP_ID");
+      setRoomProgressText(
+        "Voice disabled: missing Agora App ID in client env. Set NEXT_PUBLIC_AGORA_APP_ID and restart dev server.",
+      );
+      return;
+    }
+
+    let token: string | null = null;
+    voiceLog("joinAgoraVoice:loading SDK", {
+      appIdLength: appId.length,
+    });
+    const Agora = await import("agora-rtc-sdk-ng");
+    const AgoraRTC = Agora.default;
+    const uidHint = ensureDeviceId().slice(-6);
+    const numericUid = Number.parseInt(uidHint, 36);
+    const uid: UID = Number.isFinite(numericUid) ? numericUid : 0;
+    voiceLog("joinAgoraVoice:resolved uid", { uid, uidHint });
+
+    try {
+      const tokenResponse = await fetch(
+        `/api/agora/token?channel=${encodeURIComponent(targetRoomId)}&uid=${encodeURIComponent(String(uid))}`,
+      );
+      if (!tokenResponse.ok) {
+        const payload = (await tokenResponse.json().catch(() => null)) as
+          | { error?: string }
+          | null;
+        const errorMessage =
+          payload?.error ?? `Token API failed with status ${tokenResponse.status}`;
+        throw new Error(errorMessage);
+      }
+      const payload = (await tokenResponse.json()) as { token?: string };
+      token = payload.token?.trim() || null;
+      if (!token) {
+        throw new Error("Token API returned an empty token");
+      }
+      voiceLog("joinAgoraVoice:token fetched", { tokenLength: token.length });
+    } catch (error) {
+      voiceError("joinAgoraVoice:token fetch failed", error);
+      setRoomProgressText(
+        "Voice token fetch failed. Ensure AGORA_APP_CERTIFICATE is set on the server and retry.",
+      );
+      return;
+    }
+
+    const client = AgoraRTC.createClient({ mode: "rtc", codec: "vp8" });
+    agoraClientRef.current = client;
+    voiceLog("joinAgoraVoice:agora client created");
+
+    client.on("user-published", async (user: IAgoraRTCRemoteUser, mediaType: "audio" | "video") => {
+      voiceLog("agora event:user-published", { uid: String(user.uid), mediaType });
+      if (mediaType !== "audio") return;
+      await client.subscribe(user, mediaType);
+      if (!user.audioTrack) return;
+
+      const key = String(user.uid);
+      remoteAgoraTracksRef.current.set(key, user.audioTrack);
+      setAgoraPeerIds((prev) =>
+        prev.includes(key) ? prev : [...prev, key].sort((a, b) => a.localeCompare(b)),
+      );
+
+      user.audioTrack.play();
+      voiceLog("agora remote audio playing", { uid: key });
+    });
+
+    client.on("user-unpublished", (user: IAgoraRTCRemoteUser, mediaType: "audio" | "video") => {
+      voiceLog("agora event:user-unpublished", { uid: String(user.uid), mediaType });
+      if (mediaType !== "audio") return;
+      const key = String(user.uid);
+      remoteAgoraTracksRef.current.get(key)?.stop();
+      remoteAgoraTracksRef.current.delete(key);
+      setAgoraPeerIds((prev) => prev.filter((id) => id !== key));
+    });
+
+    client.on("user-left", (user: IAgoraRTCRemoteUser) => {
+      voiceLog("agora event:user-left", { uid: String(user.uid) });
+      const key = String(user.uid);
+      remoteAgoraTracksRef.current.get(key)?.stop();
+      remoteAgoraTracksRef.current.delete(key);
+      setAgoraPeerIds((prev) => prev.filter((id) => id !== key));
+    });
+
+    client.on("connection-state-change", (curState: string) => {
+      voiceLog("agora event:connection-state-change", { state: curState });
+      if (curState === "CONNECTED") {
+        setRoomProgressText(`Connected to room "${targetRoomId}" voice.`);
+      }
+      if (curState === "DISCONNECTED") {
+        setRoomProgressText("Voice temporarily disconnected. Reconnecting...");
+      }
+    });
+
+    try {
+      voiceLog("joinAgoraVoice:joining channel", {
+        channel: targetRoomId,
+        uid,
+      });
+      await client.join(appId, targetRoomId, token, uid);
+      voiceLog("joinAgoraVoice:channel joined");
+      const micTrack = await AgoraRTC.createMicrophoneAudioTrack({
+        AEC: true,
+        ANS: true,
+        AGC: true,
+      });
+      voiceLog("joinAgoraVoice:mic track created");
+      micTrack.setEnabled(!isMicMuted);
+      await client.publish([micTrack]);
+      voiceLog("joinAgoraVoice:mic track published");
+      localMicTrackRef.current = micTrack;
+      setAgoraConnected(true);
+      setRoomProgressText(`Connected to room "${targetRoomId}" voice.`);
+    } catch (error) {
+      const parsed = formatAgoraError(error);
+      const tokenHint =
+        "Token may be expired or mismatched with App ID/channel/uid. Verify AGORA_APP_CERTIFICATE and regenerate token.";
+
+      voiceError("joinAgoraVoice:failed", {
+        parsed,
+        hasToken: !!token,
+        targetRoomId,
+        uid,
+      });
+      await leaveAgoraVoice();
+      setRoomProgressText(
+        `Agora join failed (${String(parsed.code ?? "no-code")}): ${parsed.message}. ${tokenHint}`,
+      );
+    }
+  }
+
+  function stopMicTest() {
+    coachLog("stopMicTest:start", {
+      hasRaf: micTestRafRef.current !== null,
+      hasAudioContext: !!micTestAudioContextRef.current,
+      hasStream: !!micTestStreamRef.current,
+      usesCameraStream: micTestUsesCameraStreamRef.current,
+    });
+    if (micTestRafRef.current !== null) {
+      cancelAnimationFrame(micTestRafRef.current);
+      micTestRafRef.current = null;
+    }
+    const ctx = micTestAudioContextRef.current;
+    if (ctx) {
+      void ctx.close().catch(() => undefined);
+    }
+    micTestAudioContextRef.current = null;
+    micTestAnalyserRef.current = null;
+
+    const stream = micTestStreamRef.current;
+    if (stream && !micTestUsesCameraStreamRef.current) {
+      stream.getTracks().forEach((track) => track.stop());
+    }
+    micTestUsesCameraStreamRef.current = false;
+    micTestStreamRef.current = null;
+    setMicTestLevel(0);
+    setMicTestState("idle");
+    setMicTestMessage("Mic test is off.");
+    coachLog("stopMicTest:done");
+  }
+
+  async function startMicTest() {
+    try {
+      coachLog("startMicTest:start", {
+        hasCameraStream: !!streamRef.current,
+      });
+      stopMicTest();
+
+      let micStream: MediaStream | null = null;
+      const activeCameraStream = streamRef.current;
+      const activeCameraAudioTrack = activeCameraStream
+        ?.getAudioTracks()
+        .find((track) => track.readyState === "live" && track.enabled);
+
+      if (activeCameraAudioTrack) {
+        coachLog("startMicTest:using camera audio track");
+        micTestUsesCameraStreamRef.current = true;
+        micStream = new MediaStream([activeCameraAudioTrack]);
+      } else {
+        coachLog("startMicTest:requesting standalone mic stream");
+        micTestUsesCameraStreamRef.current = false;
+        micStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+        });
+      }
+
+      micTestStreamRef.current = micStream;
+
+      const AudioContextCtor =
+        window.AudioContext ||
+        (window as Window & { webkitAudioContext?: typeof AudioContext })
+          .webkitAudioContext;
+      if (!AudioContextCtor) {
+        coachError("startMicTest:no AudioContext available");
+        setMicTestState("error");
+        setMicTestMessage("AudioContext unavailable in this browser.");
+        return;
+      }
+
+      const ctx = new AudioContextCtor();
+      if (ctx.state === "suspended") {
+        await ctx.resume().catch(() => undefined);
+      }
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 512;
+      analyser.smoothingTimeConstant = 0.85;
+      const source = ctx.createMediaStreamSource(micStream);
+      source.connect(analyser);
+
+      micTestAudioContextRef.current = ctx;
+      micTestAnalyserRef.current = analyser;
+      setMicTestState("testing");
+      setMicTestMessage("Speak now. The bar should move with your voice.");
+      coachLog("startMicTest:testing");
+
+      const data = new Uint8Array(analyser.fftSize);
+      const tick = () => {
+        const currentAnalyser = micTestAnalyserRef.current;
+        if (!currentAnalyser) return;
+        currentAnalyser.getByteTimeDomainData(data);
+        let sumSquares = 0;
+        for (let i = 0; i < data.length; i += 1) {
+          const v = (data[i] - 128) / 128;
+          sumSquares += v * v;
+        }
+        const rms = Math.sqrt(sumSquares / data.length);
+        const level = clamp(Math.round(rms * 260), 0, 100);
+        setMicTestLevel(level);
+        micTestRafRef.current = requestAnimationFrame(tick);
+      };
+      micTestRafRef.current = requestAnimationFrame(tick);
+    } catch (error) {
+      coachError("startMicTest:error", error);
+      setMicTestState("error");
+      setMicTestMessage("Mic test failed. Check microphone permissions.");
+    }
+  }
+
   function closePeer(remoteDeviceId: string) {
+    coachLog("closePeer:start", { remoteDeviceId });
+    const recoveryTimer = peerRecoveryTimersRef.current.get(remoteDeviceId);
+    if (recoveryTimer !== undefined) {
+      window.clearTimeout(recoveryTimer);
+      peerRecoveryTimersRef.current.delete(remoteDeviceId);
+    }
     const existing = peerConnectionsRef.current.get(remoteDeviceId);
     if (existing) {
       existing.onicecandidate = null;
@@ -824,10 +1410,33 @@ export function PushupCoach() {
       peerConnectionsRef.current.delete(remoteDeviceId);
     }
     removeRemoteMedia(remoteDeviceId);
+    coachLog("closePeer:done", { remoteDeviceId });
   }
 
   function closeAllPeers() {
+    coachLog("closeAllPeers:start", {
+      peerCount: peerConnectionsRef.current.size,
+    });
     for (const remoteDeviceId of peerConnectionsRef.current.keys()) {
+      closePeer(remoteDeviceId);
+    }
+    coachLog("closeAllPeers:done");
+  }
+
+  async function restartPeerIce(remoteDeviceId: string) {
+    const pc = peerConnectionsRef.current.get(remoteDeviceId);
+    if (!pc || pc.signalingState !== "stable") return;
+    try {
+      coachLog("restartPeerIce:start", {
+        remoteDeviceId,
+        signalingState: pc.signalingState,
+      });
+      const offer = await pc.createOffer({ iceRestart: true });
+      await pc.setLocalDescription(offer);
+      await sendSignal("offer", offer, remoteDeviceId);
+      coachLog("restartPeerIce:offer sent", { remoteDeviceId });
+    } catch (error) {
+      coachError("restartPeerIce:error", { remoteDeviceId, error });
       closePeer(remoteDeviceId);
     }
   }
@@ -835,8 +1444,11 @@ export function PushupCoach() {
   function ensurePeer(remoteDeviceId: string) {
     const existing = peerConnectionsRef.current.get(remoteDeviceId);
     if (existing) {
+      coachLog("ensurePeer:existing", { remoteDeviceId });
       return existing;
     }
+
+    coachLog("ensurePeer:create", { remoteDeviceId });
 
     const pc = new RTCPeerConnection({
       iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
@@ -844,6 +1456,10 @@ export function PushupCoach() {
 
     const localStream = streamRef.current;
     if (localStream) {
+      coachLog("ensurePeer:attach local tracks", {
+        remoteDeviceId,
+        trackCount: localStream.getTracks().length,
+      });
       for (const track of localStream.getTracks()) {
         pc.addTrack(track, localStream);
       }
@@ -851,6 +1467,9 @@ export function PushupCoach() {
 
     pc.onicecandidate = (event) => {
       if (event.candidate) {
+        coachLog("peer:onicecandidate", {
+          remoteDeviceId,
+        });
         void sendSignal("ice", event.candidate.toJSON(), remoteDeviceId);
       }
     };
@@ -858,17 +1477,53 @@ export function PushupCoach() {
     pc.ontrack = (event) => {
       const firstStream = event.streams[0];
       if (firstStream) {
+        coachLog("peer:ontrack", {
+          remoteDeviceId,
+          trackCount: firstStream.getTracks().length,
+        });
         upsertRemoteMedia(remoteDeviceId, firstStream);
+        void ensureRemotePlayback(remoteDeviceId);
       }
     };
 
     pc.onconnectionstatechange = () => {
       const state = pc.connectionState;
-      if (
-        state === "failed" ||
-        state === "closed" ||
-        state === "disconnected"
-      ) {
+      coachLog("peer:connection-state-change", {
+        remoteDeviceId,
+        state,
+      });
+      if (state === "connected") {
+        const recoveryTimer = peerRecoveryTimersRef.current.get(remoteDeviceId);
+        if (recoveryTimer !== undefined) {
+          window.clearTimeout(recoveryTimer);
+          peerRecoveryTimersRef.current.delete(remoteDeviceId);
+        }
+        return;
+      }
+
+      if (state === "disconnected") {
+        setRoomProgressText("Peer connection unstable. Recovering...");
+        const existingTimer = peerRecoveryTimersRef.current.get(remoteDeviceId);
+        if (existingTimer !== undefined) return;
+        const timer = window.setTimeout(() => {
+          peerRecoveryTimersRef.current.delete(remoteDeviceId);
+          const latest = peerConnectionsRef.current.get(remoteDeviceId);
+          if (!latest) return;
+          if (latest.connectionState === "disconnected") {
+            void restartPeerIce(remoteDeviceId);
+          }
+        }, PEER_DISCONNECT_GRACE_MS);
+        peerRecoveryTimersRef.current.set(remoteDeviceId, timer);
+        return;
+      }
+
+      if (state === "failed") {
+        setRoomProgressText("Peer connection dropped. Attempting reconnect...");
+        void restartPeerIce(remoteDeviceId);
+        return;
+      }
+
+      if (state === "closed") {
         closePeer(remoteDeviceId);
       }
     };
@@ -878,15 +1533,22 @@ export function PushupCoach() {
   }
 
   async function createOfferFor(remoteDeviceId: string) {
+    coachLog("createOfferFor:start", { remoteDeviceId });
     const pc = ensurePeer(remoteDeviceId);
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
     await sendSignal("offer", offer, remoteDeviceId);
+    coachLog("createOfferFor:sent", { remoteDeviceId });
   }
 
   async function attachTracksAndRenegotiate() {
     const localStream = streamRef.current;
     if (!localStream) return;
+
+    coachLog("attachTracksAndRenegotiate:start", {
+      peers: peerConnectionsRef.current.size,
+      localTrackCount: localStream.getTracks().length,
+    });
 
     for (const [remoteDeviceId, pc] of peerConnectionsRef.current.entries()) {
       const hasVideoSender = pc
@@ -909,6 +1571,12 @@ export function PushupCoach() {
   }
 
   async function handleSignalMessage(message: SignalMessage) {
+    coachLog("handleSignalMessage", {
+      type: message.type,
+      fromDeviceId: message.fromDeviceId,
+      toDeviceId: message.toDeviceId ?? null,
+      id: message.id,
+    });
     const remoteDeviceId = message.fromDeviceId;
     if (!remoteDeviceId || remoteDeviceId === ensureDeviceId()) return;
 
@@ -953,27 +1621,47 @@ export function PushupCoach() {
   }
 
   function stopSignalPolling() {
+    coachLog("stopSignalPolling");
     if (signalPollTimerRef.current !== null) {
       window.clearInterval(signalPollTimerRef.current);
       signalPollTimerRef.current = null;
     }
+    if (signalReannounceTimerRef.current !== null) {
+      window.clearInterval(signalReannounceTimerRef.current);
+      signalReannounceTimerRef.current = null;
+    }
   }
 
   function startSignalPolling(activeRoomId: string) {
+    coachLog("startSignalPolling", {
+      activeRoomId,
+      intervalMs: SIGNAL_PULL_INTERVAL_MS,
+      reannounceMs: SIGNAL_REANNOUNCE_MS,
+    });
     stopSignalPolling();
     signalCursorRef.current = 0;
 
     const poll = async () => {
       try {
+        coachLog("signal poll:start", {
+          activeRoomId,
+          cursor: signalCursorRef.current,
+        });
         const response = await fetch(
           `/api/rooms/${encodeURIComponent(activeRoomId)}/signals?deviceId=${encodeURIComponent(ensureDeviceId())}&since=${signalCursorRef.current}`,
           { cache: "no-store" },
         );
         if (!response.ok) {
+          coachLog("signal poll:non-ok response", {
+            status: response.status,
+          });
           return;
         }
         const data = (await response.json()) as { messages?: SignalMessage[] };
         const messages = data.messages ?? [];
+        coachLog("signal poll:messages", {
+          count: messages.length,
+        });
         for (const message of messages) {
           signalCursorRef.current = Math.max(
             signalCursorRef.current,
@@ -981,7 +1669,8 @@ export function PushupCoach() {
           );
           await handleSignalMessage(message);
         }
-      } catch {
+      } catch (error) {
+        coachError("signal poll:error", error);
         setRoomProgressText("Signaling interrupted. Retrying...");
       }
     };
@@ -990,6 +1679,10 @@ export function PushupCoach() {
     signalPollTimerRef.current = window.setInterval(() => {
       void poll();
     }, SIGNAL_PULL_INTERVAL_MS);
+
+    signalReannounceTimerRef.current = window.setInterval(() => {
+      void sendSignal("join", undefined, undefined, activeRoomId);
+    }, SIGNAL_REANNOUNCE_MS);
   }
 
   useEffect(() => {
@@ -1001,6 +1694,7 @@ export function PushupCoach() {
 
     async function restoreSession() {
       try {
+        coachLog("restoreSession:start", { activeRoomId });
         const response = await fetch(
           `/api/rooms/${encodeURIComponent(activeRoomId)}/landmarks`,
           { cache: "no-store" },
@@ -1017,7 +1711,6 @@ export function PushupCoach() {
         setShareEnabled(true);
         setRemoteFeeds(devices);
         setRoomLeaderboard(data.leaderboard ?? []);
-        startSignalPolling(activeRoomId);
         await fetch(
           `/api/rooms/${encodeURIComponent(activeRoomId)}/landmarks`,
           {
@@ -1039,10 +1732,15 @@ export function PushupCoach() {
         await sendSignal("join", undefined, undefined, activeRoomId);
         if (cancelled) return;
         setRoomJoinState("joined");
+        coachLog("restoreSession:joined", {
+          activeRoomId,
+          peers: devices.length,
+        });
         setRoomProgressText(
           `Connected to room "${activeRoomId}". Peers online: ${devices.length}.`,
         );
-      } catch {
+      } catch (error) {
+        coachError("restoreSession:error", error);
         if (!cancelled) {
           clearRoomSession();
         }
@@ -1058,6 +1756,12 @@ export function PushupCoach() {
 
   async function createRoom() {
     const normalizedRoomId = normalizeRoomId(roomId);
+    coachLog("createRoom:start", {
+      roomId,
+      normalizedRoomId,
+      repCount,
+      username,
+    });
     if (!normalizedRoomId) {
       setRoomJoinState("error");
       setRoomProgressText("Enter a room name first.");
@@ -1094,14 +1798,15 @@ export function PushupCoach() {
       setShareEnabled(true);
       setRemoteFeeds([]);
       setRoomLeaderboard([]);
-      startSignalPolling(normalizedRoomId);
       await sendSignal("join", undefined, undefined, normalizedRoomId);
       setRoomJoinState("joined");
       persistRoomSession(normalizedRoomId);
       setRoomProgressText(
         `Room "${normalizedRoomId}" created. Waiting for peers...`,
       );
-    } catch {
+      coachLog("createRoom:success", { normalizedRoomId });
+    } catch (error) {
+      coachError("createRoom:error", error);
       setRoomJoinState("error");
       setRoomProgressText("Failed to create room. Please try again.");
     }
@@ -1109,6 +1814,12 @@ export function PushupCoach() {
 
   async function joinRoom() {
     const normalizedRoomId = normalizeRoomId(roomId);
+    coachLog("joinRoom:start", {
+      roomId,
+      normalizedRoomId,
+      repCount,
+      username,
+    });
     if (!normalizedRoomId) {
       setRoomJoinState("error");
       setRoomProgressText("Enter a room name first.");
@@ -1158,15 +1869,19 @@ export function PushupCoach() {
 
       setShareEnabled(true);
       setRemoteFeeds(devices);
-      setRoomLeaderboard(data.leaderboard ?? []);
-      startSignalPolling(normalizedRoomId);
+      mergeRoomLeaderboard(data.leaderboard, false);
       await sendSignal("join", undefined, undefined, normalizedRoomId);
       setRoomJoinState("joined");
       persistRoomSession(normalizedRoomId);
       setRoomProgressText(
         `Joined room "${normalizedRoomId}" successfully. Peers online: ${devices.length}.`,
       );
-    } catch {
+      coachLog("joinRoom:success", {
+        normalizedRoomId,
+        peers: devices.length,
+      });
+    } catch (error) {
+      coachError("joinRoom:error", error);
       setRoomJoinState("error");
       setRoomProgressText(
         "Failed to join room. Check room name and connection.",
@@ -1175,6 +1890,7 @@ export function PushupCoach() {
   }
 
   function stopTimer() {
+    coachLog("stopTimer");
     if (timerRef.current !== null) {
       clearInterval(timerRef.current as NodeJS.Timeout);
       timerRef.current = null;
@@ -1183,6 +1899,7 @@ export function PushupCoach() {
   }
 
   function startTimer() {
+    coachLog("startTimer");
     stopTimer();
     const start = Date.now();
     startTimestampRef.current = start;
@@ -1195,6 +1912,10 @@ export function PushupCoach() {
   }
 
   function stopCamera() {
+    voiceLog("stopCamera:start", {
+      hadStream: !!streamRef.current,
+      hadAgoraClient: !!agoraClientRef.current,
+    });
     if (rafRef.current !== null) {
       cancelAnimationFrame(rafRef.current);
       rafRef.current = null;
@@ -1203,6 +1924,7 @@ export function PushupCoach() {
       streamRef.current.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
     }
+    stopMicTest();
     if (shareAlertTimerRef.current !== null) {
       window.clearTimeout(shareAlertTimerRef.current);
       shareAlertTimerRef.current = null;
@@ -1213,6 +1935,7 @@ export function PushupCoach() {
     }
     setShowShareCameraAlert(false);
     void sendSignal("leave").catch(() => undefined);
+    void leaveAgoraVoice();
     stopSignalPolling();
     closeAllPeers();
     setRemoteFeeds([]);
@@ -1244,6 +1967,7 @@ export function PushupCoach() {
     upAngleBaselineRef.current = null;
     downStartedAtRef.current = null;
     lastRepAtRef.current = 0;
+    voiceLog("stopCamera:done");
   }
 
   useEffect(() => {
@@ -1313,6 +2037,8 @@ export function PushupCoach() {
     return () => {
       cancelled = true;
       stopSignalPolling();
+      stopMicTest();
+      void leaveAgoraVoice();
       closeAllPeers();
       if (presenceTimerRef.current !== null) {
         window.clearInterval(presenceTimerRef.current);
@@ -1423,16 +2149,13 @@ export function PushupCoach() {
         ? angleABC(rightShoulder, rightElbow, rightWrist)
         : side.elbowAngle;
     const elbowAsymmetry = Math.abs(leftElbowAngle - rightElbowAngle);
-    const frontalMode = frontalReady && elbowAsymmetry <= MAX_FRONTAL_ELBOW_ASYMMETRY;
+    const frontalMode =
+      frontalReady && elbowAsymmetry <= MAX_FRONTAL_ELBOW_ASYMMETRY;
     const rawElbowAngle = frontalMode
       ? (leftElbowAngle + rightElbowAngle) / 2
       : side.elbowAngle;
 
-    const smoothedElbow = ema(
-      rawElbowAngle,
-      elbowEmaRef.current,
-      ELBOW_ALPHA,
-    );
+    const smoothedElbow = ema(rawElbowAngle, elbowEmaRef.current, ELBOW_ALPHA);
     const smoothedBody = ema(side.bodyAngle, bodyEmaRef.current, BODY_ALPHA);
     elbowEmaRef.current = smoothedElbow;
     bodyEmaRef.current = smoothedBody;
@@ -1562,9 +2285,11 @@ export function PushupCoach() {
       const depthOk = frontalMode
         ? normalizedShoulderDepth >= MIN_SHOULDER_HEIGHT_DELTA
         : normalizedDepth >= MIN_HIP_HEIGHT_DELTA;
-      const excursionOk = elbowExcursion >=
+      const excursionOk =
+        elbowExcursion >=
         (frontalMode ? MIN_ELBOW_EXCURSION_FRONTAL : MIN_ELBOW_EXCURSION);
-      const symmetryOk = !frontalMode || elbowAsymmetry <= MAX_FRONTAL_ELBOW_ASYMMETRY;
+      const symmetryOk =
+        !frontalMode || elbowAsymmetry <= MAX_FRONTAL_ELBOW_ASYMMETRY;
       const fastDepthOk = frontalMode
         ? normalizedShoulderDepth >=
           MIN_SHOULDER_HEIGHT_DELTA * FAST_REP_DEPTH_MULTIPLIER
@@ -1578,8 +2303,7 @@ export function PushupCoach() {
           MIN_SHOULDER_HEIGHT_DELTA * STRONG_DEPTH_MULTIPLIER
         : false;
       const strongExcursionOk = frontalMode
-        ? elbowExcursion >=
-          MIN_ELBOW_EXCURSION_FRONTAL + STRONG_EXCURSION_BONUS
+        ? elbowExcursion >= MIN_ELBOW_EXCURSION_FRONTAL + STRONG_EXCURSION_BONUS
         : false;
       const fastRepCandidate =
         downDurationMs >=
@@ -1605,12 +2329,7 @@ export function PushupCoach() {
           (excursionOk && strongDepthOk)
         : depthOk || excursionOk;
 
-      if (
-        cooldownPassed &&
-        downHeldEnough &&
-        symmetryOk &&
-        frontalCountOk
-      ) {
+      if (cooldownPassed && downHeldEnough && symmetryOk && frontalCountOk) {
         setRepCount((p) => p + 1);
         const repNow = Date.now();
         setRepTimestamps((prev) => [...prev, repNow].slice(-200));
@@ -1663,8 +2382,14 @@ export function PushupCoach() {
     }
 
     if (frontalReady && elbowAsymmetry > MAX_FRONTAL_ELBOW_ASYMMETRY) {
-      score -= clamp((elbowAsymmetry - MAX_FRONTAL_ELBOW_ASYMMETRY) * 0.8, 0, 15);
-      nextFeedback.push("Keep both elbows moving together to improve front-view count accuracy.");
+      score -= clamp(
+        (elbowAsymmetry - MAX_FRONTAL_ELBOW_ASYMMETRY) * 0.8,
+        0,
+        15,
+      );
+      nextFeedback.push(
+        "Keep both elbows moving together to improve front-view count accuracy.",
+      );
     }
 
     if (nextFeedback.length === 0) {
@@ -1680,7 +2405,10 @@ export function PushupCoach() {
         [...prev, { ts: Date.now(), score: finalScore }].slice(-120),
       );
     }
-    if (performance.now() - lastMotionSampleAtRef.current >= MOTION_SAMPLE_INTERVAL_MS) {
+    if (
+      performance.now() - lastMotionSampleAtRef.current >=
+      MOTION_SAMPLE_INTERVAL_MS
+    ) {
       lastMotionSampleAtRef.current = performance.now();
       setMotionSamples((prev) =>
         [
@@ -1852,12 +2580,42 @@ export function PushupCoach() {
   }
 
   async function startCamera() {
+    coachLog("startCamera:start", {
+      hasPoseModel: !!poseLandmarkerRef.current,
+    });
     if (!poseLandmarkerRef.current) return;
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: "user" },
-      });
+      let stream: MediaStream;
+      let hasMicTrack = false;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: "user" },
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+        });
+        hasMicTrack = stream.getAudioTracks().length > 0;
+      } catch {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: "user" },
+        });
+      }
+
+      if (hasMicTrack) {
+        for (const track of stream.getAudioTracks()) {
+          track.enabled = !isMicMuted;
+        }
+      } else {
+        setIsMicMuted(true);
+      }
+
       streamRef.current = stream;
+      coachLog("startCamera:stream acquired", {
+        audioTracks: stream.getAudioTracks().length,
+        videoTracks: stream.getVideoTracks().length,
+      });
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
         // Wait until metadata loads to attach perfect aspect ratio logic immediately
@@ -1889,7 +2647,13 @@ export function PushupCoach() {
             "Camera started. Side or head-on view works. Begin controlled reps.",
           ]);
           setIsCameraOn(true);
+          setStatusText(
+            hasMicTrack
+              ? "Camera active"
+              : "Camera active. Microphone permission missing; unmute will request mic again.",
+          );
           setStatusText("Camera active");
+          coachLog("startCamera:video ready");
           setShowShareCameraAlert(true);
           if (shareAlertTimerRef.current !== null) {
             window.clearTimeout(shareAlertTimerRef.current);
@@ -1900,16 +2664,53 @@ export function PushupCoach() {
           }, 4000);
           startTimer();
           lastVideoTimeRef.current = -1;
-          await attachTracksAndRenegotiate();
           requestAnimationFrame(renderLoop);
         };
       }
-    } catch {
+    } catch (error) {
+      coachError("startCamera:error", error);
       setStatusText("Camera access denied or failed");
     }
   }
 
+  async function ensureMicTrackAvailable() {
+    const stream = streamRef.current;
+    if (!stream) return false;
+
+    const liveAudioTracks = stream
+      .getAudioTracks()
+      .filter((track) => track.readyState === "live");
+    if (liveAudioTracks.length > 0) {
+      return true;
+    }
+
+    try {
+      const audioStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+      for (const track of audioStream.getAudioTracks()) {
+        track.enabled = true;
+        stream.addTrack(track);
+      }
+      await attachTracksAndRenegotiate();
+      return true;
+    } catch {
+      setStatusText("Microphone permission blocked. Allow mic in browser settings.");
+      return false;
+    }
+  }
+
   async function endWorkout() {
+    coachLog("endWorkout:start", {
+      summaryPending,
+      isCameraOn,
+      repCount,
+      elapsedSeconds,
+    });
     if (summaryPending) return;
 
     const capturedAt = Date.now();
@@ -1938,6 +2739,10 @@ export function PushupCoach() {
     };
 
     try {
+      coachLog("endWorkout:summary request", {
+        roomId: payload.roomId,
+        telemetrySamples: payload.telemetry.length,
+      });
       const response = await fetch("/api/pushups/summary", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1950,11 +2755,16 @@ export function PushupCoach() {
 
       const data = (await response.json()) as { summary?: string };
       const summaryText = data.summary?.trim();
+      coachLog("endWorkout:summary response", {
+        hasSummary: !!summaryText,
+      });
       setWorkoutSummary(summaryText && summaryText.length > 0 ? summaryText : buildFallbackSummary());
-    } catch {
+    } catch (error) {
+      coachError("endWorkout:error", error);
       setWorkoutSummary(buildFallbackSummary());
     } finally {
       setSummaryPending(false);
+      coachLog("endWorkout:done");
     }
   }
 
@@ -1994,8 +2804,75 @@ export function PushupCoach() {
             >
               {summaryPending ? "Summarizing..." : "End workout"}
             </Button>
+            <Button
+              className="min-h-9 flex-1 sm:flex-initial"
+              onClick={() => {
+                void (async () => {
+                  if (!isCameraOn) return;
+                  if (isMicMuted) {
+                    const ready = await ensureMicTrackAvailable();
+                    if (!ready) return;
+                    setIsMicMuted(false);
+                    setStatusText("Microphone unmuted.");
+                    return;
+                  }
+                  setIsMicMuted(true);
+                  setStatusText("Microphone muted.");
+                })();
+              }}
+              variant={isMicMuted ? "destructive" : "outline"}
+              disabled={!isCameraOn}
+            >
+              {isMicMuted ? "Mic muted" : "Mic on"}
+            </Button>
+            <Button
+              className="min-h-9 flex-1 sm:flex-initial"
+              onClick={() => {
+                setIsSpeakerMuted((prev) => {
+                  const next = !prev;
+                  if (!next) {
+                    void ensureRemotePlayback();
+                  }
+                  return next;
+                });
+              }}
+              variant={isSpeakerMuted ? "destructive" : "outline"}
+            >
+              {isSpeakerMuted ? "Speaker muted" : "Speaker on"}
+            </Button>
+            <Button
+              className="min-h-9 flex-1 sm:flex-initial"
+              onClick={() => {
+                if (micTestState === "testing") {
+                  stopMicTest();
+                } else {
+                  void startMicTest();
+                }
+              }}
+              variant={micTestState === "testing" ? "destructive" : "outline"}
+            >
+              {micTestState === "testing" ? "Stop mic test" : "Test mic"}
+            </Button>
           </div>
         </header>
+
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base">Mic test</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-2">
+            <p className="text-xs text-muted-foreground">{micTestMessage}</p>
+            <div className="h-2 w-full overflow-hidden rounded bg-muted">
+              <div
+                className="h-full bg-primary transition-[width] duration-100"
+                style={{ width: `${micTestLevel}%` }}
+              />
+            </div>
+            <p className="text-xs text-muted-foreground">
+              Input level: {micTestLevel}%
+            </p>
+          </CardContent>
+        </Card>
 
         <div className="grid gap-3 sm:gap-4 lg:grid-cols-3">
           <Card>
@@ -2032,7 +2909,7 @@ export function PushupCoach() {
 
           <Card>
             <CardHeader>
-              <CardTitle className="text-base">Room relay</CardTitle>
+              <CardTitle className="text-base">Room</CardTitle>
             </CardHeader>
             <CardContent className="flex flex-col gap-3">
               <p className="text-xs text-muted-foreground">
@@ -2073,6 +2950,9 @@ export function PushupCoach() {
               </div>
               <p className="text-xs text-muted-foreground">
                 {roomProgressText}
+              </p>
+              <p className="text-xs text-muted-foreground">
+                Voice: {agoraConnected ? "connected" : "disconnected"} · peers: {agoraPeerIds.length}
               </p>
             </CardContent>
           </Card>
@@ -2217,23 +3097,80 @@ export function PushupCoach() {
                   <CardTitle className="text-base">Form score trend</CardTitle>
                 </CardHeader>
                 <CardContent className="flex flex-col gap-3">
-                  <div className="rounded-lg border bg-muted/25 p-2">
+                  <div className="relative h-36 rounded-lg border bg-muted/25 p-2">
+                    <span className="pointer-events-none absolute left-2 top-1 text-[10px] text-muted-foreground/80">
+                      Score
+                    </span>
+                    <span className="pointer-events-none absolute bottom-1 right-2 text-[10px] text-muted-foreground/80">
+                      Time
+                    </span>
                     {formPoints ? (
-                      <svg viewBox="0 0 100 100" className="h-40 w-full">
-                        <line x1="10" y1="92" x2="96" y2="92" stroke="currentColor" strokeOpacity="0.35" strokeWidth="0.7" />
-                        <line x1="10" y1="14" x2="10" y2="92" stroke="currentColor" strokeOpacity="0.35" strokeWidth="0.7" />
-                        <line x1="10" y1="53" x2="96" y2="53" stroke="currentColor" strokeOpacity="0.12" strokeWidth="0.6" />
-                        <polyline points={formPoints} fill="none" stroke="currentColor" strokeWidth="1.7" className="text-primary" />
-                        <text x="4" y="16" fontSize="4" className="fill-muted-foreground">100</text>
-                        <text x="4" y="55" fontSize="4" className="fill-muted-foreground">50</text>
-                        <text x="5" y="92" fontSize="4" className="fill-muted-foreground">0</text>
-                        <text x="44" y="99" fontSize="4" className="fill-muted-foreground">X: time samples</text>
-                        <text x="1.8" y="48" transform="rotate(-90 1.8 48)" fontSize="4" className="fill-muted-foreground">Y: form score</text>
+                      <svg viewBox="0 0 100 100" className="h-full w-full">
+                        <line
+                          x1="10"
+                          y1="92"
+                          x2="96"
+                          y2="92"
+                          stroke="currentColor"
+                          strokeOpacity="0.35"
+                          strokeWidth="0.7"
+                        />
+                        <line
+                          x1="10"
+                          y1="14"
+                          x2="10"
+                          y2="92"
+                          stroke="currentColor"
+                          strokeOpacity="0.35"
+                          strokeWidth="0.7"
+                        />
+                        <line
+                          x1="10"
+                          y1="53"
+                          x2="96"
+                          y2="53"
+                          stroke="currentColor"
+                          strokeOpacity="0.12"
+                          strokeWidth="0.6"
+                        />
+                        <polyline
+                          points={formPoints}
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="1.7"
+                          className="text-primary"
+                        />
+                        <text
+                          x="4"
+                          y="16"
+                          fontSize="4"
+                          className="fill-muted-foreground"
+                        >
+                          100
+                        </text>
+                        <text
+                          x="4"
+                          y="55"
+                          fontSize="4"
+                          className="fill-muted-foreground"
+                        >
+                          50
+                        </text>
+                        <text
+                          x="5"
+                          y="92"
+                          fontSize="4"
+                          className="fill-muted-foreground"
+                        >
+                          0
+                        </text>
                       </svg>
                     ) : (
-                      <p className="text-sm text-muted-foreground">
-                        Start camera to record form trend.
-                      </p>
+                      <div className="flex h-full items-center px-3">
+                        <p className="text-sm text-muted-foreground">
+                          Start camera to record form trend.
+                        </p>
+                      </div>
                     )}
                   </div>
                 </CardContent>
@@ -2247,15 +3184,81 @@ export function PushupCoach() {
                   <div className="rounded-lg border bg-muted/25 p-2">
                     {elbowPoints ? (
                       <svg viewBox="0 0 100 100" className="h-40 w-full">
-                        <line x1="10" y1="92" x2="96" y2="92" stroke="currentColor" strokeOpacity="0.35" strokeWidth="0.7" />
-                        <line x1="10" y1="14" x2="10" y2="92" stroke="currentColor" strokeOpacity="0.35" strokeWidth="0.7" />
-                        <line x1="10" y1="53" x2="96" y2="53" stroke="currentColor" strokeOpacity="0.12" strokeWidth="0.6" />
-                        <polyline points={elbowPoints} fill="none" stroke="currentColor" strokeWidth="1.7" className="text-emerald-500" />
-                        <text x="2.5" y="16" fontSize="4" className="fill-muted-foreground">180</text>
-                        <text x="2.5" y="55" fontSize="4" className="fill-muted-foreground">125</text>
-                        <text x="2.5" y="92" fontSize="4" className="fill-muted-foreground">70</text>
-                        <text x="44" y="99" fontSize="4" className="fill-muted-foreground">X: time samples</text>
-                        <text x="1.8" y="48" transform="rotate(-90 1.8 48)" fontSize="4" className="fill-muted-foreground">Y: elbow angle</text>
+                        <line
+                          x1="10"
+                          y1="92"
+                          x2="96"
+                          y2="92"
+                          stroke="currentColor"
+                          strokeOpacity="0.35"
+                          strokeWidth="0.7"
+                        />
+                        <line
+                          x1="10"
+                          y1="14"
+                          x2="10"
+                          y2="92"
+                          stroke="currentColor"
+                          strokeOpacity="0.35"
+                          strokeWidth="0.7"
+                        />
+                        <line
+                          x1="10"
+                          y1="53"
+                          x2="96"
+                          y2="53"
+                          stroke="currentColor"
+                          strokeOpacity="0.12"
+                          strokeWidth="0.6"
+                        />
+                        <polyline
+                          points={elbowPoints}
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="1.7"
+                          className="text-emerald-500"
+                        />
+                        <text
+                          x="2.5"
+                          y="16"
+                          fontSize="4"
+                          className="fill-muted-foreground"
+                        >
+                          180
+                        </text>
+                        <text
+                          x="2.5"
+                          y="55"
+                          fontSize="4"
+                          className="fill-muted-foreground"
+                        >
+                          125
+                        </text>
+                        <text
+                          x="2.5"
+                          y="92"
+                          fontSize="4"
+                          className="fill-muted-foreground"
+                        >
+                          70
+                        </text>
+                        <text
+                          x="44"
+                          y="99"
+                          fontSize="4"
+                          className="fill-muted-foreground"
+                        >
+                          X: time samples
+                        </text>
+                        <text
+                          x="1.8"
+                          y="48"
+                          transform="rotate(-90 1.8 48)"
+                          fontSize="4"
+                          className="fill-muted-foreground"
+                        >
+                          Y: elbow angle
+                        </text>
                       </svg>
                     ) : (
                       <p className="text-sm text-muted-foreground">
@@ -2274,15 +3277,81 @@ export function PushupCoach() {
                   <div className="rounded-lg border bg-muted/25 p-2">
                     {bodyDeviationPoints ? (
                       <svg viewBox="0 0 100 100" className="h-40 w-full">
-                        <line x1="10" y1="92" x2="96" y2="92" stroke="currentColor" strokeOpacity="0.35" strokeWidth="0.7" />
-                        <line x1="10" y1="14" x2="10" y2="92" stroke="currentColor" strokeOpacity="0.35" strokeWidth="0.7" />
-                        <line x1="10" y1="53" x2="96" y2="53" stroke="currentColor" strokeOpacity="0.12" strokeWidth="0.6" />
-                        <polyline points={bodyDeviationPoints} fill="none" stroke="currentColor" strokeWidth="1.7" className="text-amber-500" />
-                        <text x="4" y="16" fontSize="4" className="fill-muted-foreground">60</text>
-                        <text x="4" y="55" fontSize="4" className="fill-muted-foreground">30</text>
-                        <text x="5" y="92" fontSize="4" className="fill-muted-foreground">0</text>
-                        <text x="44" y="99" fontSize="4" className="fill-muted-foreground">X: time samples</text>
-                        <text x="1.8" y="48" transform="rotate(-90 1.8 48)" fontSize="4" className="fill-muted-foreground">Y: degrees</text>
+                        <line
+                          x1="10"
+                          y1="92"
+                          x2="96"
+                          y2="92"
+                          stroke="currentColor"
+                          strokeOpacity="0.35"
+                          strokeWidth="0.7"
+                        />
+                        <line
+                          x1="10"
+                          y1="14"
+                          x2="10"
+                          y2="92"
+                          stroke="currentColor"
+                          strokeOpacity="0.35"
+                          strokeWidth="0.7"
+                        />
+                        <line
+                          x1="10"
+                          y1="53"
+                          x2="96"
+                          y2="53"
+                          stroke="currentColor"
+                          strokeOpacity="0.12"
+                          strokeWidth="0.6"
+                        />
+                        <polyline
+                          points={bodyDeviationPoints}
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="1.7"
+                          className="text-amber-500"
+                        />
+                        <text
+                          x="4"
+                          y="16"
+                          fontSize="4"
+                          className="fill-muted-foreground"
+                        >
+                          60
+                        </text>
+                        <text
+                          x="4"
+                          y="55"
+                          fontSize="4"
+                          className="fill-muted-foreground"
+                        >
+                          30
+                        </text>
+                        <text
+                          x="5"
+                          y="92"
+                          fontSize="4"
+                          className="fill-muted-foreground"
+                        >
+                          0
+                        </text>
+                        <text
+                          x="44"
+                          y="99"
+                          fontSize="4"
+                          className="fill-muted-foreground"
+                        >
+                          X: time samples
+                        </text>
+                        <text
+                          x="1.8"
+                          y="48"
+                          transform="rotate(-90 1.8 48)"
+                          fontSize="4"
+                          className="fill-muted-foreground"
+                        >
+                          Y: degrees
+                        </text>
                       </svg>
                     ) : (
                       <p className="text-sm text-muted-foreground">
@@ -2301,15 +3370,81 @@ export function PushupCoach() {
                   <div className="rounded-lg border bg-muted/25 p-2">
                     {depthPoints ? (
                       <svg viewBox="0 0 100 100" className="h-40 w-full">
-                        <line x1="10" y1="92" x2="96" y2="92" stroke="currentColor" strokeOpacity="0.35" strokeWidth="0.7" />
-                        <line x1="10" y1="14" x2="10" y2="92" stroke="currentColor" strokeOpacity="0.35" strokeWidth="0.7" />
-                        <line x1="10" y1="53" x2="96" y2="53" stroke="currentColor" strokeOpacity="0.12" strokeWidth="0.6" />
-                        <polyline points={depthPoints} fill="none" stroke="currentColor" strokeWidth="1.7" className="text-cyan-500" />
-                        <text x="4" y="16" fontSize="4" className="fill-muted-foreground">20</text>
-                        <text x="4" y="55" fontSize="4" className="fill-muted-foreground">10</text>
-                        <text x="5" y="92" fontSize="4" className="fill-muted-foreground">0</text>
-                        <text x="44" y="99" fontSize="4" className="fill-muted-foreground">X: time samples</text>
-                        <text x="1.8" y="48" transform="rotate(-90 1.8 48)" fontSize="4" className="fill-muted-foreground">Y: depth %</text>
+                        <line
+                          x1="10"
+                          y1="92"
+                          x2="96"
+                          y2="92"
+                          stroke="currentColor"
+                          strokeOpacity="0.35"
+                          strokeWidth="0.7"
+                        />
+                        <line
+                          x1="10"
+                          y1="14"
+                          x2="10"
+                          y2="92"
+                          stroke="currentColor"
+                          strokeOpacity="0.35"
+                          strokeWidth="0.7"
+                        />
+                        <line
+                          x1="10"
+                          y1="53"
+                          x2="96"
+                          y2="53"
+                          stroke="currentColor"
+                          strokeOpacity="0.12"
+                          strokeWidth="0.6"
+                        />
+                        <polyline
+                          points={depthPoints}
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="1.7"
+                          className="text-cyan-500"
+                        />
+                        <text
+                          x="4"
+                          y="16"
+                          fontSize="4"
+                          className="fill-muted-foreground"
+                        >
+                          20
+                        </text>
+                        <text
+                          x="4"
+                          y="55"
+                          fontSize="4"
+                          className="fill-muted-foreground"
+                        >
+                          10
+                        </text>
+                        <text
+                          x="5"
+                          y="92"
+                          fontSize="4"
+                          className="fill-muted-foreground"
+                        >
+                          0
+                        </text>
+                        <text
+                          x="44"
+                          y="99"
+                          fontSize="4"
+                          className="fill-muted-foreground"
+                        >
+                          X: time samples
+                        </text>
+                        <text
+                          x="1.8"
+                          y="48"
+                          transform="rotate(-90 1.8 48)"
+                          fontSize="4"
+                          className="fill-muted-foreground"
+                        >
+                          Y: depth %
+                        </text>
                       </svg>
                     ) : (
                       <p className="text-sm text-muted-foreground">
@@ -2322,51 +3457,67 @@ export function PushupCoach() {
 
               <Card>
                 <CardHeader>
-                  <CardTitle className="text-base">Rep pace (seconds)</CardTitle>
+                  <CardTitle className="text-base">
+                    Rep pace (seconds)
+                  </CardTitle>
                 </CardHeader>
                 <CardContent className="flex flex-col gap-3">
-                  <div className="rounded-lg border bg-muted/25 p-2">
-                    {repDurations.length > 0 ? (
-                      <svg viewBox="0 0 100 100" className="h-40 w-full">
-                        <line x1="10" y1="92" x2="96" y2="92" stroke="currentColor" strokeOpacity="0.35" strokeWidth="0.7" />
-                        <line x1="10" y1="14" x2="10" y2="92" stroke="currentColor" strokeOpacity="0.35" strokeWidth="0.7" />
-                        <line x1="10" y1="53" x2="96" y2="53" stroke="currentColor" strokeOpacity="0.12" strokeWidth="0.6" />
+                  {repDurations.length > 0 ? (
+                    <div className="relative h-36 rounded-lg border bg-muted/25 px-2 py-2">
+                      <span className="pointer-events-none absolute left-2 top-1 text-[10px] text-muted-foreground/80">
+                        Rep time
+                      </span>
+                      <span className="pointer-events-none absolute bottom-1 right-2 text-[10px] text-muted-foreground/80">
+                        Recent reps
+                      </span>
+                      <span className="pointer-events-none absolute left-1 top-3 text-[9px] text-muted-foreground/70">
+                        {repPaceScaleMax}s
+                      </span>
+                      <span className="pointer-events-none absolute left-1 top-1/2 -translate-y-1/2 text-[9px] text-muted-foreground/70">
+                        {(repPaceScaleMax / 2).toFixed(1)}s
+                      </span>
+                      <span className="pointer-events-none absolute left-1 bottom-3 text-[9px] text-muted-foreground/70">
+                        0s
+                      </span>
+                      <div className="pointer-events-none absolute bottom-3 left-8 right-2 top-3">
+                        <div className="absolute inset-x-0 bottom-0 border-b border-border/60" />
+                        <div className="absolute bottom-0 left-0 top-0 border-l border-border/60" />
+                      </div>
+                      <div className="absolute bottom-3 left-8 right-2 top-3 flex items-end gap-1">
                         {repDurations.map((duration, index) => {
-                          const barWidth = 86 / Math.max(1, repDurations.length);
-                          const x = 10 + index * barWidth + 0.5;
-                          const height = clamp((duration / repPaceMax) * 78, 4, 78);
-                          const y = 92 - height;
+                          const height = clamp(
+                            (duration / repPaceScaleMax) * 100,
+                            6,
+                            100,
+                          );
                           return (
-                            <rect
+                            <div
                               key={`${duration}-${index}`}
-                              x={x}
-                              y={y}
-                              width={Math.max(1.8, barWidth - 1)}
-                              height={height}
-                              className="fill-primary/90"
+                              className="min-w-0 flex-1 rounded-sm bg-primary/85"
+                              style={{ height: `${height}%` }}
+                              title={`${duration.toFixed(1)}s`}
                             />
                           );
                         })}
-                        <text x="2" y="16" fontSize="4" className="fill-muted-foreground">{repPaceMax.toFixed(1)}</text>
-                        <text x="2" y="55" fontSize="4" className="fill-muted-foreground">{(repPaceMax / 2).toFixed(1)}</text>
-                        <text x="5" y="92" fontSize="4" className="fill-muted-foreground">0</text>
-                        <text x="44" y="99" fontSize="4" className="fill-muted-foreground">X: rep index</text>
-                        <text x="1.8" y="48" transform="rotate(-90 1.8 48)" fontSize="4" className="fill-muted-foreground">Y: seconds</text>
-                      </svg>
-                    ) : (
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="flex h-36 items-center rounded-lg border bg-muted/25 px-3">
                       <p className="text-sm text-muted-foreground">
                         Rep duration graph appears after 2 reps.
                       </p>
-                    )}
-                  </div>
+                    </div>
+                  )}
                 </CardContent>
               </Card>
             </div>
 
-            {(workoutSummary || summaryPending) ? (
+            {workoutSummary || summaryPending ? (
               <Card>
                 <CardHeader>
-                  <CardTitle className="text-base">AI workout summary</CardTitle>
+                  <CardTitle className="text-base">
+                    AI workout summary
+                  </CardTitle>
                 </CardHeader>
                 <CardContent className="space-y-2">
                   <p className="text-xs text-muted-foreground">
@@ -2398,11 +3549,16 @@ export function PushupCoach() {
                         className="aspect-video w-full object-cover"
                         autoPlay
                         playsInline
-                        muted
+                        muted={isSpeakerMuted}
                         ref={(node) => {
                           if (node && node.srcObject !== feed.stream) {
                             node.srcObject = feed.stream;
+                            node.muted = isSpeakerMuted;
+                            if (!isSpeakerMuted) {
+                              void node.play().catch(() => undefined);
+                            }
                           }
+                          setRemoteVideoRef(feed.deviceId, node);
                         }}
                       />
                       <p className="px-2 py-1 text-xs text-muted-foreground">
