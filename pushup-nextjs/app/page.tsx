@@ -76,6 +76,7 @@ const REP_COOLDOWN_MS = 280
 const SHARE_PUSH_INTERVAL_MS = 100
 const SHARE_PULL_INTERVAL_MS = 180
 const SIGNAL_PULL_INTERVAL_MS = 300
+const LEADERBOARD_PUSH_THROTTLE_MS = 120
 
 const SHOULDER_L = 11
 const SHOULDER_R = 12
@@ -204,6 +205,7 @@ export default function Home() {
   const lastRepAtRef = useRef(0)
   const deviceIdRef = useRef('dev-pending')
   const lastSharePushAtRef = useRef(0)
+  const lastLeaderboardPushAtRef = useRef(0)
   const remoteFeedsRef = useRef<RemoteDeviceFeed[]>([])
   const remoteMediaFeedsRef = useRef<RemoteMediaFeed[]>([])
   const signalPollTimerRef = useRef<number | null>(null)
@@ -249,6 +251,31 @@ export default function Home() {
   useEffect(() => {
     remoteMediaFeedsRef.current = remoteMediaFeeds
   }, [remoteMediaFeeds])
+
+  useEffect(() => {
+    if (!shareEnabled || !roomId.trim()) {
+      return
+    }
+
+    const now = performance.now()
+    if (now - lastLeaderboardPushAtRef.current < LEADERBOARD_PUSH_THROTTLE_MS) {
+      return
+    }
+    lastLeaderboardPushAtRef.current = now
+
+    void fetch(`/api/rooms/${encodeURIComponent(roomId.trim())}/landmarks`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        deviceId: deviceIdRef.current,
+        username: username.trim() || `User-${deviceIdRef.current.slice(-4)}`,
+        reps: repCount,
+        updatedAt: Date.now(),
+        poseLandmarks: [],
+        handLandmarks: [],
+      }),
+    })
+  }, [shareEnabled, roomId, repCount, username])
 
   useEffect(() => {
     if (!shareEnabled || !roomId.trim()) {

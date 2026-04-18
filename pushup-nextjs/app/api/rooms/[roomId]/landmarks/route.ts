@@ -203,8 +203,14 @@ export async function POST(
   if (USE_UPSTASH) {
     try {
       const current = await readFromUpstash(normalizedRoomId)
+      const existing = current.find((d) => d.deviceId === normalizedDeviceId)
+      const mergedFeed: DeviceFeed = {
+        ...nextFeed,
+        reps: Math.max(existing?.reps ?? 0, nextFeed.reps),
+        username: nextFeed.username || existing?.username || 'Anonymous',
+      }
       const withoutCurrent = current.filter((d) => d.deviceId !== normalizedDeviceId)
-      withoutCurrent.push(nextFeed)
+      withoutCurrent.push(mergedFeed)
       await writeToUpstash(normalizedRoomId, withoutCurrent)
       return NextResponse.json({ ok: true, relay: 'upstash' })
     } catch {
@@ -218,7 +224,12 @@ export async function POST(
   const room = getRoom(normalizedRoomId)
   pruneRoom(room)
 
-  room.devices.set(normalizedDeviceId, nextFeed)
+  const existing = room.devices.get(normalizedDeviceId)
+  room.devices.set(normalizedDeviceId, {
+    ...nextFeed,
+    reps: Math.max(existing?.reps ?? 0, nextFeed.reps),
+    username: nextFeed.username || existing?.username || 'Anonymous',
+  })
 
   return NextResponse.json({ ok: true, relay: 'memory' })
 }
