@@ -35,6 +35,8 @@ type RemoteDeviceFeed = {
   handLandmarks: WireLandmark[][]
 }
 
+type RoomJoinState = 'idle' | 'creating' | 'joining' | 'joined' | 'error'
+
 const MODEL_URL =
   'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task'
 const HAND_MODEL_LOCAL_URL = '/assets/hand_landmarker.task'
@@ -141,6 +143,8 @@ export default function Home() {
   const [roomId, setRoomId] = useState('pushups')
   const [shareEnabled, setShareEnabled] = useState(false)
   const [remoteFeeds, setRemoteFeeds] = useState<RemoteDeviceFeed[]>([])
+  const [roomJoinState, setRoomJoinState] = useState<RoomJoinState>('idle')
+  const [roomProgressText, setRoomProgressText] = useState('Not connected to a room yet.')
 
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
@@ -203,9 +207,16 @@ export default function Home() {
         const data = (await response.json()) as { devices?: RemoteDeviceFeed[] }
         const devices = (data.devices ?? []).filter((d) => d.deviceId !== deviceIdRef.current)
         setRemoteFeeds(devices)
+        if (roomJoinState === 'joined') {
+          setRoomProgressText(
+            `Connected to room "${roomId.trim()}". Peers online: ${devices.length}.`,
+          )
+        }
       } catch {
         if (!stopped) {
           setStatusText('Room relay unreachable. Verify server/network connection.')
+          setRoomJoinState('error')
+          setRoomProgressText('Room connection lost. Retrying...')
         }
       }
     }
@@ -217,7 +228,78 @@ export default function Home() {
       stopped = true
       window.clearInterval(interval)
     }
-  }, [shareEnabled, roomId])
+  }, [shareEnabled, roomId, roomJoinState])
+
+  async function createRoom() {
+    const normalizedRoomId = roomId.trim()
+    if (!normalizedRoomId) {
+      setRoomJoinState('error')
+      setRoomProgressText('Enter a room name first.')
+      return
+    }
+
+    setRoomJoinState('creating')
+    setRoomProgressText(`Creating room "${normalizedRoomId}"...`)
+
+    try {
+      const response = await fetch(`/api/rooms/${encodeURIComponent(normalizedRoomId)}/landmarks`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          deviceId: deviceIdRef.current,
+          updatedAt: Date.now(),
+          poseLandmarks: [],
+          handLandmarks: [],
+        }),
+      })
+
+      if (!response.ok) {
+        throw new Error('Room creation failed')
+      }
+
+      setShareEnabled(true)
+      setRemoteFeeds([])
+      setRoomJoinState('joined')
+      setRoomProgressText(`Room "${normalizedRoomId}" created. Waiting for peers...`)
+    } catch {
+      setRoomJoinState('error')
+      setRoomProgressText('Failed to create room. Please try again.')
+    }
+  }
+
+  async function joinRoom() {
+    const normalizedRoomId = roomId.trim()
+    if (!normalizedRoomId) {
+      setRoomJoinState('error')
+      setRoomProgressText('Enter a room name first.')
+      return
+    }
+
+    setRoomJoinState('joining')
+    setRoomProgressText(`Joining room "${normalizedRoomId}"...`)
+
+    try {
+      const response = await fetch(`/api/rooms/${encodeURIComponent(normalizedRoomId)}/landmarks`, {
+        cache: 'no-store',
+      })
+      if (!response.ok) {
+        throw new Error('Join room failed')
+      }
+
+      const data = (await response.json()) as { devices?: RemoteDeviceFeed[] }
+      const devices = (data.devices ?? []).filter((d) => d.deviceId !== deviceIdRef.current)
+
+      setShareEnabled(true)
+      setRemoteFeeds(devices)
+      setRoomJoinState('joined')
+      setRoomProgressText(
+        `Joined room "${normalizedRoomId}" successfully. Peers online: ${devices.length}.`,
+      )
+    } catch {
+      setRoomJoinState('error')
+      setRoomProgressText('Failed to join room. Check room name and connection.')
+    }
+  }
 
   function stopTimer() {
     if (timerRef.current !== null) {
@@ -741,14 +823,23 @@ export default function Home() {
               placeholder="pushup-lab"
             />
           </label>
-          <label className="inline-flex items-center gap-2 text-sm">
-            <input
-              type="checkbox"
-              checked={shareEnabled}
-              onChange={(e) => setShareEnabled(e.target.checked)}
-            />
-            Enable room sharing webhook
-          </label>
+          <div className="flex gap-2">
+            <button
+              onClick={createRoom}
+              disabled={roomJoinState === 'creating' || roomJoinState === 'joining'}
+              className="px-4 py-2 rounded bg-blue-600 hover:bg-blue-500 disabled:opacity-50"
+            >
+              {roomJoinState === 'creating' ? 'Creating...' : 'Create Room'}
+            </button>
+            <button
+              onClick={joinRoom}
+              disabled={roomJoinState === 'creating' || roomJoinState === 'joining'}
+              className="px-4 py-2 rounded bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50"
+            >
+              {roomJoinState === 'joining' ? 'Joining...' : 'Join Room'}
+            </button>
+          </div>
+          <p className="text-xs text-neutral-300">Room status: {roomProgressText}</p>
           <p className="text-xs text-neutral-400">
             Device ID: {deviceIdRef.current}
           </p>
