@@ -328,7 +328,8 @@ function InsightsSidebarBody({
   const heatMapStartDate = useMemo(() => {
     const start = new Date();
     start.setHours(0, 0, 0, 0);
-    start.setDate(start.getDate() - 182);
+    // Shorter range so cells are readable in the right rail.
+    start.setDate(start.getDate() - 120);
     return start;
   }, []);
 
@@ -397,7 +398,7 @@ function InsightsSidebarBody({
                 value={heatMapValues}
                 startDate={heatMapStartDate}
                 endDate={heatMapEndDate}
-                rectSize={8}
+                rectSize={10}
                 space={2}
                 legendCellSize={0}
                 weekLabels={["", "", "", "", "", "", ""]}
