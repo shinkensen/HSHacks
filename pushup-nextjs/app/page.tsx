@@ -1111,6 +1111,22 @@ export default function Home() {
         <div className="video-container">
           <video ref={videoRef} className="camera-feed" playsInline muted />
           <canvas ref={canvasRef} className="overlay-canvas" />
+          <div className="absolute right-3 top-3 z-20 w-52 rounded-md border border-emerald-400/40 bg-black/55 p-2 backdrop-blur-sm pointer-events-none">
+            <p className="text-[11px] uppercase tracking-wide text-emerald-300">Leaderboard</p>
+            <div className="mt-1 space-y-1">
+              {leaderboard.slice(0, 5).map((entry, index) => (
+                <div
+                  key={entry.deviceId}
+                  className="flex items-center justify-between rounded bg-neutral-900/80 px-2 py-1 text-xs"
+                >
+                  <span className="truncate pr-2 text-neutral-100">
+                    #{index + 1} {entry.username}{entry.isSelf ? ' (You)' : ''}
+                  </span>
+                  <span className="font-bold text-emerald-300">{entry.reps}</span>
+                </div>
+              ))}
+            </div>
+          </div>
         </div>
 
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-center">
@@ -1180,28 +1196,6 @@ export default function Home() {
           <p className="text-xs text-neutral-400">
             Device ID: {deviceIdRef.current}
           </p>
-        </div>
-
-        <div className="bg-neutral-800 p-4 rounded-lg space-y-3">
-          <h2 className="font-semibold">Room Leaderboard</h2>
-          <p className="text-xs text-neutral-400">Top reps in this room (live)</p>
-          <div className="space-y-2">
-            {leaderboard.map((entry, index) => (
-              <div
-                key={entry.deviceId}
-                className="flex items-center justify-between rounded bg-neutral-900 px-3 py-2 text-sm"
-              >
-                <div className="flex items-center gap-2">
-                  <span className="text-neutral-400">#{index + 1}</span>
-                  <span className="font-medium">
-                    {entry.username}
-                    {entry.isSelf ? ' (You)' : ''}
-                  </span>
-                </div>
-                <span className="font-bold text-emerald-300">{entry.reps}</span>
-              </div>
-            ))}
-          </div>
         </div>
 
         {remoteMediaFeeds.length > 0 && (
