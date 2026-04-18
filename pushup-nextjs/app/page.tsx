@@ -375,9 +375,7 @@ export default function Home() {
         }
       } catch {
         if (!stopped) {
-          setStatusText(
-            "Room relay unreachable. Verify server/network connection.",
-          );
+          setStatusText("Room unreachable. Verify server/network connection.");
           setRoomJoinState("error");
           setRoomProgressText("Room connection lost. Retrying...");
         }
@@ -1389,7 +1387,7 @@ export default function Home() {
         </div>
 
         <div className="bg-neutral-800 p-4 rounded-lg space-y-3">
-          <h2 className="font-semibold">Cloud Room Relay</h2>
+          <h2 className="font-semibold">Cloud Room</h2>
           <p className="text-sm text-neutral-300">
             Use the same room ID on all devices. Relay is handled by this server
             (Redis enabled).

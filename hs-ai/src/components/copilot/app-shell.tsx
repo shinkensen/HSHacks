@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { UserButton, useAuth, useUser } from "@clerk/nextjs";
 import { useQuery } from "convex/react";
+import dynamic from "next/dynamic";
 import Image from "next/image";
 import { usePathname, useRouter } from "next/navigation";
 
@@ -52,6 +53,19 @@ type DaySummary = {
 };
 
 type PushupSessionItem = PushupCalendarSession;
+type SidebarCalendarDay = {
+  dayKey: string;
+  workouts?: number;
+  totalReps?: number;
+  calories?: number;
+  sessionsCompleted?: number;
+  stepsCompleted?: number;
+  focusMinutes?: number;
+};
+
+const ActivityHeatMap = dynamic(() => import("@uiw/react-heat-map"), {
+  ssr: false,
+});
 
 function formatShortDate(timestamp: number): string {
   return new Date(timestamp).toLocaleDateString(undefined, {
@@ -92,6 +106,10 @@ function toLocalDayKey(date: Date): string {
   const month = String(date.getMonth() + 1).padStart(2, "0");
   const day = String(date.getDate()).padStart(2, "0");
   return `${year}-${month}-${day}`;
+}
+
+function toHeatmapDayKey(dayKey: string): string {
+  return dayKey.replaceAll("-", "/");
 }
 
 function AppSidebarLeft({
@@ -255,7 +273,7 @@ function InsightsSidebarBody({
   weeklyPushups: PushupStats;
   yesterday: { sessions: number; stepsCompleted: number; focusMinutes: number };
   streak: { current: number; longest: number; lastActiveDayKey: string | null };
-  calendarDays: Array<{ dayKey: string }>;
+  calendarDays: SidebarCalendarDay[];
 }) {
   const activeDaySet = useMemo(
     () => new Set(calendarDays.map((day) => day.dayKey)),
@@ -264,6 +282,70 @@ function InsightsSidebarBody({
   const router = useRouter();
   const isWorkoutMode = mode !== "copilot";
   const workoutHref = mode === "crunches" ? "/crunches" : "/pushups";
+  const trendActivityByDay = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const day of calendarDays) {
+      const value = isWorkoutMode
+        ? day.totalReps ?? 0
+        : day.stepsCompleted ?? day.sessionsCompleted ?? 0;
+      map.set(day.dayKey, Math.max(0, Math.floor(value)));
+    }
+    return map;
+  }, [calendarDays, isWorkoutMode]);
+  const heatMapActivityByDay = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const day of calendarDays) {
+      const value = isWorkoutMode
+        ? day.workouts ?? 0
+        : day.sessionsCompleted ?? day.stepsCompleted ?? 0;
+      map.set(day.dayKey, Math.max(0, Math.floor(value)));
+    }
+    return map;
+  }, [calendarDays, isWorkoutMode]);
+
+  const trendSeries = useMemo(() => {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const points: Array<{ dayKey: string; label: string; value: number }> = [];
+    for (let offset = 6; offset >= 0; offset -= 1) {
+      const day = new Date(today);
+      day.setDate(today.getDate() - offset);
+      const dayKey = toLocalDayKey(day);
+      points.push({
+        dayKey,
+        label: day.toLocaleDateString(undefined, { weekday: "short" }).slice(0, 1),
+        value: trendActivityByDay.get(dayKey) ?? 0,
+      });
+    }
+    return points;
+  }, [trendActivityByDay]);
+
+  const trendMax = useMemo(
+    () => Math.max(1, ...trendSeries.map((point) => point.value)),
+    [trendSeries],
+  );
+
+  const heatMapStartDate = useMemo(() => {
+    const start = new Date();
+    start.setHours(0, 0, 0, 0);
+    start.setDate(start.getDate() - 182);
+    return start;
+  }, []);
+
+  const heatMapEndDate = useMemo(() => {
+    const end = new Date();
+    end.setHours(23, 59, 59, 999);
+    return end;
+  }, []);
+
+  const heatMapValues = useMemo(
+    () =>
+      Array.from(heatMapActivityByDay.entries()).map(([dayKey, count]) => ({
+        date: toHeatmapDayKey(dayKey),
+        count,
+      })),
+    [heatMapActivityByDay],
+  );
 
   return (
     <>
@@ -271,6 +353,64 @@ function InsightsSidebarBody({
         <p className="px-1 text-xs font-medium sm:px-2 sm:text-sm">Weekly view</p>
       </SidebarHeader>
       <SidebarContent className="max-h-[min(100dvh,100vh)] overflow-y-auto overscroll-contain pb-4">
+        <SidebarGroup className="px-0 sm:px-1">
+          <SidebarGroupLabel className="px-2">
+            {isWorkoutMode ? "Reps trend (7d)" : "Steps trend (7d)"}
+          </SidebarGroupLabel>
+          <SidebarGroupContent className="min-w-0 w-full max-w-full px-1 pb-2 sm:px-2">
+            <div className="w-full min-w-0 max-w-full overflow-hidden rounded-md border border-border/30 bg-muted/15 px-2 py-2">
+              <svg viewBox="0 0 230 92" className="h-24 w-full" role="img" aria-label="Last seven days activity chart">
+                <line x1="16" y1="8" x2="16" y2="74" stroke="#d4ddd6" strokeWidth="1" />
+                <line x1="16" y1="74" x2="224" y2="74" stroke="#d4ddd6" strokeWidth="1" />
+                {trendSeries.map((point, index) => {
+                  const barHeight = Math.max(2, (point.value / trendMax) * 60);
+                  const x = 24 + index * 28;
+                  const y = 74 - barHeight;
+                  return (
+                    <g key={point.dayKey}>
+                      <rect
+                        x={x}
+                        y={y}
+                        width={16}
+                        height={barHeight}
+                        rx={3}
+                        className="fill-primary/75"
+                      />
+                      <text x={x + 8} y={86} textAnchor="middle" className="fill-muted-foreground text-[8px]">
+                        {point.label}
+                      </text>
+                    </g>
+                  );
+                })}
+                <text x="220" y="10" textAnchor="end" className="fill-muted-foreground text-[8px]">
+                  max {trendMax}
+                </text>
+              </svg>
+            </div>
+          </SidebarGroupContent>
+        </SidebarGroup>
+        <SidebarGroup className="px-0 sm:px-1">
+          <SidebarGroupLabel className="px-2">Activity heatmap</SidebarGroupLabel>
+          <SidebarGroupContent className="min-w-0 w-full max-w-full px-1 pb-2 sm:px-2">
+            <div className="w-full min-w-0 max-w-full overflow-hidden rounded-md border border-border/30 bg-muted/15 px-1 py-2">
+              <ActivityHeatMap
+                value={heatMapValues}
+                startDate={heatMapStartDate}
+                endDate={heatMapEndDate}
+                rectSize={6}
+                space={1}
+                width={234}
+                legendCellSize={0}
+                weekLabels={["", "", "", "", "", "", ""]}
+                panelColors={["#edf4ee", "#cfe4d2", "#98ca9f", "#57a468", "#1f6b39"]}
+                style={{ color: "#2f6f3d" }}
+              />
+            </div>
+            <p className="px-1 pt-1 text-[11px] text-muted-foreground">
+              Last 6 months by workout days
+            </p>
+          </SidebarGroupContent>
+        </SidebarGroup>
         <SidebarGroup className="px-0 sm:px-1">
           <SidebarGroupLabel className="px-2">Calendar</SidebarGroupLabel>
           <SidebarGroupContent className="min-w-0 w-full max-w-full px-1 pb-2 sm:px-2">

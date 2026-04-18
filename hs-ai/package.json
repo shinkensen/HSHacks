@@ -15,7 +15,11 @@
     "@hugeicons/react": "^1.1.6",
     "@mediapipe/tasks-vision": "^0.10.34",
     "@shivantra/react-web-camera": "^1.1.0",
+<<<<<<< HEAD
     "agora-access-token": "^2.0.4",
+=======
+    "@uiw/react-heat-map": "^2.3.3",
+>>>>>>> fa89c8d (refine right-rail activity visuals and workout controls)
     "agora-rtc-sdk-ng": "^4.24.3",
     "ai": "^6.0.168",
     "class-variance-authority": "^0.7.1",

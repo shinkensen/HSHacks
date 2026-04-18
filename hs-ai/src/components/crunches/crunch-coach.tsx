@@ -81,18 +81,18 @@ const WASM_URL =
 const MEDIAPIPE_DELEGATE: "CPU" | "GPU" = "CPU";
 
 const POSE_MIN_VIS = 0.45;
-const MIN_REP_FRAMES = 2;
-const MIN_HIP_HEIGHT_DELTA = 0.025;
-const MIN_SHOULDER_HEIGHT_DELTA = 0.018;
+const MIN_REP_FRAMES = 3;
+const MIN_HIP_HEIGHT_DELTA = 0.02;
+const MIN_SHOULDER_HEIGHT_DELTA = 0.013;
 const ELBOW_ALPHA = 0.42;
 const BODY_ALPHA = 0.22;
 const COMPRESSION_ALPHA = 0.32;
-const REP_COOLDOWN_MS = 420;
-const MIN_DOWN_HOLD_MS = 130;
-const MIN_CORE_EXCURSION_DEG = 20;
-const MIN_COMPRESSION_DEPTH = 0.045;
-const ENTER_DOWN_COMPRESSION = 0.03;
-const EXIT_UP_COMPRESSION = 0.016;
+const REP_COOLDOWN_MS = 520;
+const MIN_DOWN_HOLD_MS = 120;
+const MIN_CORE_EXCURSION_DEG = 16;
+const MIN_COMPRESSION_DEPTH = 0.032;
+const ENTER_DOWN_COMPRESSION = 0.02;
+const EXIT_UP_COMPRESSION = 0.012;
 const MOTION_SAMPLE_INTERVAL_MS = 400;
 const MAX_MOTION_SAMPLES = 360;
 const SHARE_PUSH_INTERVAL_MS = 100;
@@ -253,7 +253,8 @@ function sortLeaderboardEntries<T extends { username: string; reps: number }>(
 ): T[] {
   return [...entries].sort(
     (a, b) =>
-      b.reps - a.reps || a.username.localeCompare(b.username, undefined, { sensitivity: "base" }),
+      b.reps - a.reps ||
+      a.username.localeCompare(b.username, undefined, { sensitivity: "base" }),
   );
 }
 
@@ -377,6 +378,13 @@ export function CrunchCoach() {
   const [summaryCapturedAt, setSummaryCapturedAt] = useState<number | null>(
     null,
   );
+  const [isMicMuted, setIsMicMuted] = useState(false);
+  const [isSpeakerMuted, setIsSpeakerMuted] = useState(false);
+  const [micTestState, setMicTestState] = useState<
+    "idle" | "testing" | "error"
+  >("idle");
+  const [micTestLevel, setMicTestLevel] = useState(0);
+  const [micTestMessage, setMicTestMessage] = useState("Mic test is off.");
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -413,6 +421,12 @@ export function CrunchCoach() {
   const presenceTimerRef = useRef<number | null>(null);
   const signalCursorRef = useRef(0);
   const peerConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
+  const remoteVideoRefs = useRef<Map<string, HTMLVideoElement>>(new Map());
+  const micTestStreamRef = useRef<MediaStream | null>(null);
+  const micTestAudioContextRef = useRef<AudioContext | null>(null);
+  const micTestAnalyserRef = useRef<AnalyserNode | null>(null);
+  const micTestRafRef = useRef<number | null>(null);
+  const micTestUsesCameraStreamRef = useRef(false);
   const shareAlertTimerRef = useRef<number | null>(null);
   const lastFormPointAtRef = useRef(0);
   const lastRepRecordedAtRef = useRef<number | null>(null);
@@ -566,9 +580,7 @@ export function CrunchCoach() {
           return {
             deviceId: entry.userId,
             username: entry.username,
-            reps: isSelf
-              ? Math.max(entry.reps, effectiveReps)
-              : entry.reps,
+            reps: isSelf ? Math.max(entry.reps, effectiveReps) : entry.reps,
             isSelf,
           };
         })
@@ -589,15 +601,8 @@ export function CrunchCoach() {
         reps: Number.isFinite(feed.reps) ? feed.reps : 0,
         isSelf: false,
       })),
-    ])
-      .slice(0, 10);
-  }, [
-    effectiveReps,
-    profileUsername,
-    remoteFeeds,
-    roomLeaderboard,
-    username,
-  ]);
+    ]).slice(0, 10);
+  }, [effectiveReps, profileUsername, remoteFeeds, roomLeaderboard, username]);
 
   useEffect(() => {
     const id = normalizeRoomId(roomId);
@@ -635,11 +640,17 @@ export function CrunchCoach() {
   }, [repTimestamps]);
 
   const repPaceScaleMax = useMemo(() => {
-    const maxDuration = repDurations.reduce((max, value) => Math.max(max, value), 0);
+    const maxDuration = repDurations.reduce(
+      (max, value) => Math.max(max, value),
+      0,
+    );
     return Math.max(2, Math.ceil(maxDuration));
   }, [repDurations]);
 
-  const chartSamples = useMemo(() => motionSamples.slice(-120), [motionSamples]);
+  const chartSamples = useMemo(
+    () => motionSamples.slice(-120),
+    [motionSamples],
+  );
 
   const elbowSeries = useMemo(
     () => chartSamples.map((sample) => sample.elbowAngle),
@@ -656,7 +667,8 @@ export function CrunchCoach() {
       chartSamples.map((sample) =>
         Number(
           (
-            Math.max(sample.normalizedDepth, sample.normalizedShoulderDepth) * 100
+            Math.max(sample.normalizedDepth, sample.normalizedShoulderDepth) *
+            100
           ).toFixed(2),
         ),
       ),
@@ -736,6 +748,12 @@ export function CrunchCoach() {
   }, [remoteMediaFeeds]);
 
   useEffect(() => {
+    if (!isSpeakerMuted && remoteMediaFeeds.length > 0) {
+      void ensureRemotePlayback();
+    }
+  }, [isSpeakerMuted, remoteMediaFeeds]);
+
+  useEffect(() => {
     const normalizedRoomId = normalizeRoomId(roomId);
     if (!shareEnabled || !normalizedRoomId) {
       return;
@@ -747,21 +765,24 @@ export function CrunchCoach() {
     }
     lastLeaderboardPushAtRef.current = now;
 
-    void fetch(`/api/crunch-rooms/${encodeURIComponent(normalizedRoomId)}/landmarks`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        deviceId: ensureDeviceId(),
-        username:
-          username.trim().length > 0
-            ? normalizeUsername(username)
-            : `User-${ensureDeviceId().slice(-4)}`,
-        reps: repCount,
-        updatedAt: Date.now(),
-        poseLandmarks: [],
-        handLandmarks: [],
-      }),
-    });
+    void fetch(
+      `/api/crunch-rooms/${encodeURIComponent(normalizedRoomId)}/landmarks`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          deviceId: ensureDeviceId(),
+          username:
+            username.trim().length > 0
+              ? normalizeUsername(username)
+              : `User-${ensureDeviceId().slice(-4)}`,
+          reps: repCount,
+          updatedAt: Date.now(),
+          poseLandmarks: [],
+          handLandmarks: [],
+        }),
+      },
+    );
   }, [shareEnabled, roomId, repCount, username]);
 
   useEffect(() => {
@@ -797,9 +818,7 @@ export function CrunchCoach() {
         }
       } catch {
         if (!stopped) {
-          setStatusText(
-            "Room relay unreachable. Verify server/network connection.",
-          );
+          setStatusText("Room unreachable. Verify server/network connection.");
           setRoomJoinState("error");
           setRoomProgressText("Room connection lost. Retrying...");
         }
@@ -871,19 +890,154 @@ export function CrunchCoach() {
     const normalizedRoomId = normalizeRoomId(overrideRoomId ?? roomId);
     if (!normalizedRoomId) return;
 
-    await fetch(`/api/crunch-rooms/${encodeURIComponent(normalizedRoomId)}/signals`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        fromDeviceId: ensureDeviceId(),
-        toDeviceId,
-        type,
-        payload,
-        username: normalizeUsername(username),
-        finalReps: repCount,
-        clientDayKey: toLocalDayKey(new Date()),
+    await fetch(
+      `/api/crunch-rooms/${encodeURIComponent(normalizedRoomId)}/signals`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          fromDeviceId: ensureDeviceId(),
+          toDeviceId,
+          type,
+          payload,
+          username: normalizeUsername(username),
+          finalReps: repCount,
+          clientDayKey: toLocalDayKey(new Date()),
+        }),
+      },
+    );
+  }
+
+  function setRemoteVideoRef(deviceId: string, node: HTMLVideoElement | null) {
+    if (node) {
+      remoteVideoRefs.current.set(deviceId, node);
+      return;
+    }
+    remoteVideoRefs.current.delete(deviceId);
+  }
+
+  async function ensureRemotePlayback(deviceId?: string) {
+    if (isSpeakerMuted) return;
+    const nodes = deviceId
+      ? [remoteVideoRefs.current.get(deviceId)].filter(
+          (node): node is HTMLVideoElement => !!node,
+        )
+      : Array.from(remoteVideoRefs.current.values());
+
+    await Promise.all(
+      nodes.map(async (node) => {
+        node.muted = false;
+        try {
+          await node.play();
+        } catch {
+          // Browser autoplay restrictions can block initial playback.
+        }
       }),
-    });
+    );
+  }
+
+  useEffect(() => {
+    const stream = streamRef.current;
+    if (!stream) return;
+    for (const track of stream.getAudioTracks()) {
+      track.enabled = !isMicMuted;
+    }
+  }, [isMicMuted]);
+
+  function stopMicTest() {
+    if (micTestRafRef.current !== null) {
+      cancelAnimationFrame(micTestRafRef.current);
+      micTestRafRef.current = null;
+    }
+    const ctx = micTestAudioContextRef.current;
+    if (ctx) {
+      void ctx.close().catch(() => undefined);
+    }
+    micTestAudioContextRef.current = null;
+    micTestAnalyserRef.current = null;
+
+    const stream = micTestStreamRef.current;
+    if (stream && !micTestUsesCameraStreamRef.current) {
+      stream.getTracks().forEach((track) => track.stop());
+    }
+    micTestUsesCameraStreamRef.current = false;
+    micTestStreamRef.current = null;
+    setMicTestLevel(0);
+    setMicTestState("idle");
+    setMicTestMessage("Mic test is off.");
+  }
+
+  async function startMicTest() {
+    try {
+      stopMicTest();
+
+      let micStream: MediaStream | null = null;
+      const activeCameraStream = streamRef.current;
+      const activeCameraAudioTrack = activeCameraStream
+        ?.getAudioTracks()
+        .find((track) => track.readyState === "live" && track.enabled);
+
+      if (activeCameraAudioTrack) {
+        micTestUsesCameraStreamRef.current = true;
+        micStream = new MediaStream([activeCameraAudioTrack]);
+      } else {
+        micTestUsesCameraStreamRef.current = false;
+        micStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+        });
+      }
+
+      micTestStreamRef.current = micStream;
+
+      const AudioContextCtor =
+        window.AudioContext ||
+        (window as Window & { webkitAudioContext?: typeof AudioContext })
+          .webkitAudioContext;
+      if (!AudioContextCtor) {
+        setMicTestState("error");
+        setMicTestMessage("AudioContext unavailable in this browser.");
+        return;
+      }
+
+      const ctx = new AudioContextCtor();
+      if (ctx.state === "suspended") {
+        await ctx.resume().catch(() => undefined);
+      }
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 512;
+      analyser.smoothingTimeConstant = 0.85;
+      const source = ctx.createMediaStreamSource(micStream);
+      source.connect(analyser);
+
+      micTestAudioContextRef.current = ctx;
+      micTestAnalyserRef.current = analyser;
+      setMicTestState("testing");
+      setMicTestMessage("Speak now. The bar should move with your voice.");
+
+      const data = new Uint8Array(analyser.fftSize);
+      const tick = () => {
+        const currentAnalyser = micTestAnalyserRef.current;
+        if (!currentAnalyser) return;
+        currentAnalyser.getByteTimeDomainData(data);
+        let sumSquares = 0;
+        for (let i = 0; i < data.length; i += 1) {
+          const v = (data[i] - 128) / 128;
+          sumSquares += v * v;
+        }
+        const rms = Math.sqrt(sumSquares / data.length);
+        const level = clamp(Math.round(rms * 260), 0, 100);
+        setMicTestLevel(level);
+        micTestRafRef.current = requestAnimationFrame(tick);
+      };
+      micTestRafRef.current = requestAnimationFrame(tick);
+    } catch {
+      setMicTestState("error");
+      setMicTestMessage("Mic test failed. Check microphone permissions.");
+    }
   }
 
   function closePeer(remoteDeviceId: string) {
@@ -931,6 +1085,7 @@ export function CrunchCoach() {
       const firstStream = event.streams[0];
       if (firstStream) {
         upsertRemoteMedia(remoteDeviceId, firstStream);
+        void ensureRemotePlayback(remoteDeviceId);
       }
     };
 
@@ -1275,6 +1430,7 @@ export function CrunchCoach() {
       streamRef.current.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
     }
+    stopMicTest();
     if (shareAlertTimerRef.current !== null) {
       window.clearTimeout(shareAlertTimerRef.current);
       shareAlertTimerRef.current = null;
@@ -1416,10 +1572,7 @@ export function CrunchCoach() {
     const required = [shoulder, hip, knee, ankle];
     const visibleCount = required.filter((lm) => isVisible(lm)).length;
     const quality = visibleCount / required.length;
-    const valid =
-      isVisible(shoulder) &&
-      isVisible(hip) &&
-      isVisible(knee);
+    const valid = isVisible(shoulder) && isVisible(hip) && isVisible(knee);
 
     if (!valid) {
       return {
@@ -1446,7 +1599,9 @@ export function CrunchCoach() {
         isVisible(elbow) && isVisible(wrist)
           ? angleABC(shoulder!, elbow!, wrist!)
           : 0,
-      wristShoulderDx: isVisible(wrist) ? Math.abs(wrist!.x - shoulder!.x) : 0.08,
+      wristShoulderDx: isVisible(wrist)
+        ? Math.abs(wrist!.x - shoulder!.x)
+        : 0.08,
       quality,
       valid: true,
     };
@@ -1491,16 +1646,12 @@ export function CrunchCoach() {
         ? angleABC(rightShoulder, rightHip, rightKnee)
         : side.elbowAngle;
     const coreAsymmetry = Math.abs(leftCoreAngle - rightCoreAngle);
-    const frontalMode = frontalReady && coreAsymmetry <= 24;
+    const frontalMode = frontalReady && coreAsymmetry <= 36;
     const rawCoreAngle = frontalMode
       ? (leftCoreAngle + rightCoreAngle) / 2
       : side.elbowAngle;
 
-    const smoothedCore = ema(
-      rawCoreAngle,
-      elbowEmaRef.current,
-      ELBOW_ALPHA,
-    );
+    const smoothedCore = ema(rawCoreAngle, elbowEmaRef.current, ELBOW_ALPHA);
     const smoothedBody = ema(side.bodyAngle, bodyEmaRef.current, BODY_ALPHA);
     elbowEmaRef.current = smoothedCore;
     bodyEmaRef.current = smoothedBody;
@@ -1630,7 +1781,7 @@ export function CrunchCoach() {
       150,
       176,
     );
-    const downThreshold = clamp(upThreshold - 38, 102, 138);
+    const downThreshold = clamp(upThreshold - 30, 108, 142);
 
     const isDownNow =
       smoothedCore <= downThreshold ||
@@ -1688,20 +1839,22 @@ export function CrunchCoach() {
         ? now - downStartedAtRef.current
         : 0;
       const depthOk =
-        normalizedShoulderDepth >= MIN_SHOULDER_HEIGHT_DELTA * 2.8 ||
-        normalizedDepth >= MIN_HIP_HEIGHT_DELTA * 2.4;
+        normalizedShoulderDepth >= MIN_SHOULDER_HEIGHT_DELTA * 1.8 ||
+        normalizedDepth >= MIN_HIP_HEIGHT_DELTA * 1.5;
       const compressionOk = compressionDepth >= MIN_COMPRESSION_DEPTH;
       const excursionOk = coreExcursion >= MIN_CORE_EXCURSION_DEG;
-      const symmetryOk = !frontalMode || coreAsymmetry <= 24;
+      const symmetryOk = !frontalMode || coreAsymmetry <= 36;
       const cooldownPassed = now - lastRepAtRef.current >= REP_COOLDOWN_MS;
       const downHeldEnough = downDurationMs >= MIN_DOWN_HOLD_MS;
 
+      const repSignals =
+        Number(depthOk) + Number(compressionOk) + Number(excursionOk);
       if (
         cooldownPassed &&
         downHeldEnough &&
         symmetryOk &&
-        (depthOk || compressionOk) &&
-        excursionOk
+        compressionOk &&
+        repSignals >= 2
       ) {
         setRepCount((p) => p + 1);
         const repNow = Date.now();
@@ -1736,7 +1889,8 @@ export function CrunchCoach() {
       nextFeedback.push("Reset fully at bottom before next crunch.");
     }
 
-    const liveCompressionDepth = cycleMaxCompressionRef.current ?? compressionProgress;
+    const liveCompressionDepth =
+      cycleMaxCompressionRef.current ?? compressionProgress;
     if (
       stageRef.current === "down" &&
       liveCompressionDepth < MIN_COMPRESSION_DEPTH * 0.85
@@ -1754,8 +1908,8 @@ export function CrunchCoach() {
       nextFeedback.push("Curl shoulders higher at top of each crunch.");
     }
 
-    if (frontalReady && coreAsymmetry > 24) {
-      score -= clamp((coreAsymmetry - 24) * 0.8, 0, 15);
+    if (frontalReady && coreAsymmetry > 36) {
+      score -= clamp((coreAsymmetry - 36) * 0.8, 0, 15);
       nextFeedback.push("Lift evenly on both sides to avoid twisting.");
     }
 
@@ -1772,7 +1926,10 @@ export function CrunchCoach() {
         [...prev, { ts: Date.now(), score: finalScore }].slice(-120),
       );
     }
-    if (performance.now() - lastMotionSampleAtRef.current >= MOTION_SAMPLE_INTERVAL_MS) {
+    if (
+      performance.now() - lastMotionSampleAtRef.current >=
+      MOTION_SAMPLE_INTERVAL_MS
+    ) {
       lastMotionSampleAtRef.current = performance.now();
       setMotionSamples((prev) =>
         [
@@ -1946,9 +2103,30 @@ export function CrunchCoach() {
   async function startCamera() {
     if (!poseLandmarkerRef.current) return;
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: "user" },
-      });
+      let stream: MediaStream;
+      let hasMicTrack = false;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: "user" },
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+        });
+        hasMicTrack = stream.getAudioTracks().length > 0;
+      } catch {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: "user" },
+        });
+      }
+      if (hasMicTrack) {
+        for (const track of stream.getAudioTracks()) {
+          track.enabled = !isMicMuted;
+        }
+      } else {
+        setIsMicMuted(true);
+      }
       streamRef.current = stream;
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
@@ -1983,7 +2161,11 @@ export function CrunchCoach() {
             "Camera started. Side or head-on view works. Begin controlled reps.",
           ]);
           setIsCameraOn(true);
-          setStatusText("Camera active");
+          setStatusText(
+            hasMicTrack
+              ? "Camera active"
+              : "Camera active. Microphone permission missing; unmute will request mic again.",
+          );
           setShowShareCameraAlert(true);
           if (shareAlertTimerRef.current !== null) {
             window.clearTimeout(shareAlertTimerRef.current);
@@ -2000,6 +2182,35 @@ export function CrunchCoach() {
       }
     } catch {
       setStatusText("Camera access denied or failed");
+    }
+  }
+
+  async function ensureMicTrackAvailable() {
+    const stream = streamRef.current;
+    if (!stream) return false;
+    const liveAudioTracks = stream
+      .getAudioTracks()
+      .filter((track) => track.readyState === "live");
+    if (liveAudioTracks.length > 0) {
+      return true;
+    }
+    try {
+      const audioStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+      for (const track of audioStream.getAudioTracks()) {
+        track.enabled = true;
+        stream.addTrack(track);
+      }
+      await attachTracksAndRenegotiate();
+      return true;
+    } catch {
+      setStatusText("Microphone permission blocked. Allow mic in browser settings.");
+      return false;
     }
   }
 
@@ -2044,7 +2255,11 @@ export function CrunchCoach() {
 
       const data = (await response.json()) as { summary?: string };
       const summaryText = data.summary?.trim();
-      setWorkoutSummary(summaryText && summaryText.length > 0 ? summaryText : buildFallbackSummary());
+      setWorkoutSummary(
+        summaryText && summaryText.length > 0
+          ? summaryText
+          : buildFallbackSummary(),
+      );
     } catch {
       setWorkoutSummary(buildFallbackSummary());
     } finally {
@@ -2088,8 +2303,126 @@ export function CrunchCoach() {
             >
               {summaryPending ? "Summarizing..." : "End workout"}
             </Button>
+            <Button
+              className="min-h-9 flex-1 sm:flex-initial"
+              onClick={() => {
+                void (async () => {
+                  if (!isCameraOn) return;
+                  if (isMicMuted) {
+                    const ready = await ensureMicTrackAvailable();
+                    if (!ready) return;
+                    setIsMicMuted(false);
+                    setStatusText("Microphone unmuted.");
+                    return;
+                  }
+                  setIsMicMuted(true);
+                  setStatusText("Microphone muted.");
+                })();
+              }}
+              variant={isMicMuted ? "destructive" : "outline"}
+              disabled={!isCameraOn}
+            >
+              {isMicMuted ? "Mic muted" : "Mic on"}
+            </Button>
+            <Button
+              className="min-h-9 flex-1 sm:flex-initial"
+              onClick={() => {
+                setIsSpeakerMuted((prev) => {
+                  const next = !prev;
+                  if (!next) {
+                    void ensureRemotePlayback();
+                  }
+                  return next;
+                });
+              }}
+              variant={isSpeakerMuted ? "destructive" : "outline"}
+            >
+              {isSpeakerMuted ? "Speaker muted" : "Speaker on"}
+            </Button>
+            <Button
+              className="min-h-9 flex-1 sm:flex-initial"
+              onClick={() => {
+                if (micTestState === "testing") {
+                  stopMicTest();
+                } else {
+                  void startMicTest();
+                }
+              }}
+              variant={micTestState === "testing" ? "destructive" : "outline"}
+            >
+              {micTestState === "testing" ? "Stop mic test" : "Test mic"}
+            </Button>
           </div>
         </header>
+
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base">Mic settings</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <div className="flex flex-wrap gap-2">
+              <Button
+                className="min-h-9 flex-1 sm:flex-initial"
+                onClick={() => {
+                  void (async () => {
+                    if (!isCameraOn) return;
+                    if (isMicMuted) {
+                      const ready = await ensureMicTrackAvailable();
+                      if (!ready) return;
+                      setIsMicMuted(false);
+                      setStatusText("Microphone unmuted.");
+                      return;
+                    }
+                    setIsMicMuted(true);
+                    setStatusText("Microphone muted.");
+                  })();
+                }}
+                variant={isMicMuted ? "destructive" : "outline"}
+                disabled={!isCameraOn}
+              >
+                {isMicMuted ? "Mic muted" : "Mic on"}
+              </Button>
+              <Button
+                className="min-h-9 flex-1 sm:flex-initial"
+                onClick={() => {
+                  setIsSpeakerMuted((prev) => {
+                    const next = !prev;
+                    if (!next) {
+                      void ensureRemotePlayback();
+                    }
+                    return next;
+                  });
+                }}
+                variant={isSpeakerMuted ? "destructive" : "outline"}
+              >
+                {isSpeakerMuted ? "Speaker muted" : "Speaker on"}
+              </Button>
+              <Button
+                className="min-h-9 flex-1 sm:flex-initial"
+                onClick={() => {
+                  if (micTestState === "testing") {
+                    stopMicTest();
+                  } else {
+                    void startMicTest();
+                  }
+                }}
+                variant={micTestState === "testing" ? "destructive" : "outline"}
+              >
+                {micTestState === "testing" ? "Stop mic test" : "Test mic"}
+              </Button>
+            </div>
+            <p className="text-xs text-muted-foreground">{micTestMessage}</p>
+            <div className="h-2 w-full overflow-hidden rounded bg-muted">
+              <div
+                className="h-full bg-primary transition-[width] duration-100"
+                style={{ width: `${micTestLevel}%` }}
+              />
+            </div>
+            <p className="text-xs text-muted-foreground">
+              Input level: {micTestLevel}%
+            </p>
+          </CardContent>
+        </Card>
 
         <div className="grid gap-3 sm:gap-4 lg:grid-cols-3">
           <Card>
@@ -2126,7 +2459,7 @@ export function CrunchCoach() {
 
           <Card>
             <CardHeader>
-              <CardTitle className="text-base">Room relay</CardTitle>
+              <CardTitle className="text-base">Room</CardTitle>
             </CardHeader>
             <CardContent className="flex flex-col gap-3">
               <p className="text-xs text-muted-foreground">
@@ -2320,13 +2653,64 @@ export function CrunchCoach() {
                     </span>
                     {formPoints ? (
                       <svg viewBox="0 0 100 100" className="h-full w-full">
-                        <line x1="10" y1="92" x2="96" y2="92" stroke="currentColor" strokeOpacity="0.35" strokeWidth="0.7" />
-                        <line x1="10" y1="14" x2="10" y2="92" stroke="currentColor" strokeOpacity="0.35" strokeWidth="0.7" />
-                        <line x1="10" y1="53" x2="96" y2="53" stroke="currentColor" strokeOpacity="0.12" strokeWidth="0.6" />
-                        <polyline points={formPoints} fill="none" stroke="currentColor" strokeWidth="1.7" className="text-primary" />
-                        <text x="4" y="16" fontSize="4" className="fill-muted-foreground">100</text>
-                        <text x="4" y="55" fontSize="4" className="fill-muted-foreground">50</text>
-                        <text x="5" y="92" fontSize="4" className="fill-muted-foreground">0</text>
+                        <line
+                          x1="10"
+                          y1="92"
+                          x2="96"
+                          y2="92"
+                          stroke="currentColor"
+                          strokeOpacity="0.35"
+                          strokeWidth="0.7"
+                        />
+                        <line
+                          x1="10"
+                          y1="14"
+                          x2="10"
+                          y2="92"
+                          stroke="currentColor"
+                          strokeOpacity="0.35"
+                          strokeWidth="0.7"
+                        />
+                        <line
+                          x1="10"
+                          y1="53"
+                          x2="96"
+                          y2="53"
+                          stroke="currentColor"
+                          strokeOpacity="0.12"
+                          strokeWidth="0.6"
+                        />
+                        <polyline
+                          points={formPoints}
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="1.7"
+                          className="text-primary"
+                        />
+                        <text
+                          x="4"
+                          y="16"
+                          fontSize="4"
+                          className="fill-muted-foreground"
+                        >
+                          100
+                        </text>
+                        <text
+                          x="4"
+                          y="55"
+                          fontSize="4"
+                          className="fill-muted-foreground"
+                        >
+                          50
+                        </text>
+                        <text
+                          x="5"
+                          y="92"
+                          fontSize="4"
+                          className="fill-muted-foreground"
+                        >
+                          0
+                        </text>
                       </svg>
                     ) : (
                       <div className="flex h-full items-center px-3">
@@ -2347,15 +2731,81 @@ export function CrunchCoach() {
                   <div className="rounded-lg border bg-muted/25 p-2">
                     {elbowPoints ? (
                       <svg viewBox="0 0 100 100" className="h-40 w-full">
-                        <line x1="10" y1="92" x2="96" y2="92" stroke="currentColor" strokeOpacity="0.35" strokeWidth="0.7" />
-                        <line x1="10" y1="14" x2="10" y2="92" stroke="currentColor" strokeOpacity="0.35" strokeWidth="0.7" />
-                        <line x1="10" y1="53" x2="96" y2="53" stroke="currentColor" strokeOpacity="0.12" strokeWidth="0.6" />
-                        <polyline points={elbowPoints} fill="none" stroke="currentColor" strokeWidth="1.7" className="text-emerald-500" />
-                        <text x="2.5" y="16" fontSize="4" className="fill-muted-foreground">180</text>
-                        <text x="2.5" y="55" fontSize="4" className="fill-muted-foreground">125</text>
-                        <text x="2.5" y="92" fontSize="4" className="fill-muted-foreground">70</text>
-                        <text x="44" y="99" fontSize="4" className="fill-muted-foreground">X: time samples</text>
-                        <text x="1.8" y="48" transform="rotate(-90 1.8 48)" fontSize="4" className="fill-muted-foreground">Y: elbow angle</text>
+                        <line
+                          x1="10"
+                          y1="92"
+                          x2="96"
+                          y2="92"
+                          stroke="currentColor"
+                          strokeOpacity="0.35"
+                          strokeWidth="0.7"
+                        />
+                        <line
+                          x1="10"
+                          y1="14"
+                          x2="10"
+                          y2="92"
+                          stroke="currentColor"
+                          strokeOpacity="0.35"
+                          strokeWidth="0.7"
+                        />
+                        <line
+                          x1="10"
+                          y1="53"
+                          x2="96"
+                          y2="53"
+                          stroke="currentColor"
+                          strokeOpacity="0.12"
+                          strokeWidth="0.6"
+                        />
+                        <polyline
+                          points={elbowPoints}
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="1.7"
+                          className="text-emerald-500"
+                        />
+                        <text
+                          x="2.5"
+                          y="16"
+                          fontSize="4"
+                          className="fill-muted-foreground"
+                        >
+                          180
+                        </text>
+                        <text
+                          x="2.5"
+                          y="55"
+                          fontSize="4"
+                          className="fill-muted-foreground"
+                        >
+                          125
+                        </text>
+                        <text
+                          x="2.5"
+                          y="92"
+                          fontSize="4"
+                          className="fill-muted-foreground"
+                        >
+                          70
+                        </text>
+                        <text
+                          x="44"
+                          y="99"
+                          fontSize="4"
+                          className="fill-muted-foreground"
+                        >
+                          X: time samples
+                        </text>
+                        <text
+                          x="1.8"
+                          y="48"
+                          transform="rotate(-90 1.8 48)"
+                          fontSize="4"
+                          className="fill-muted-foreground"
+                        >
+                          Y: elbow angle
+                        </text>
                       </svg>
                     ) : (
                       <p className="text-sm text-muted-foreground">
@@ -2374,15 +2824,81 @@ export function CrunchCoach() {
                   <div className="rounded-lg border bg-muted/25 p-2">
                     {bodyDeviationPoints ? (
                       <svg viewBox="0 0 100 100" className="h-40 w-full">
-                        <line x1="10" y1="92" x2="96" y2="92" stroke="currentColor" strokeOpacity="0.35" strokeWidth="0.7" />
-                        <line x1="10" y1="14" x2="10" y2="92" stroke="currentColor" strokeOpacity="0.35" strokeWidth="0.7" />
-                        <line x1="10" y1="53" x2="96" y2="53" stroke="currentColor" strokeOpacity="0.12" strokeWidth="0.6" />
-                        <polyline points={bodyDeviationPoints} fill="none" stroke="currentColor" strokeWidth="1.7" className="text-amber-500" />
-                        <text x="4" y="16" fontSize="4" className="fill-muted-foreground">60</text>
-                        <text x="4" y="55" fontSize="4" className="fill-muted-foreground">30</text>
-                        <text x="5" y="92" fontSize="4" className="fill-muted-foreground">0</text>
-                        <text x="44" y="99" fontSize="4" className="fill-muted-foreground">X: time samples</text>
-                        <text x="1.8" y="48" transform="rotate(-90 1.8 48)" fontSize="4" className="fill-muted-foreground">Y: degrees</text>
+                        <line
+                          x1="10"
+                          y1="92"
+                          x2="96"
+                          y2="92"
+                          stroke="currentColor"
+                          strokeOpacity="0.35"
+                          strokeWidth="0.7"
+                        />
+                        <line
+                          x1="10"
+                          y1="14"
+                          x2="10"
+                          y2="92"
+                          stroke="currentColor"
+                          strokeOpacity="0.35"
+                          strokeWidth="0.7"
+                        />
+                        <line
+                          x1="10"
+                          y1="53"
+                          x2="96"
+                          y2="53"
+                          stroke="currentColor"
+                          strokeOpacity="0.12"
+                          strokeWidth="0.6"
+                        />
+                        <polyline
+                          points={bodyDeviationPoints}
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="1.7"
+                          className="text-amber-500"
+                        />
+                        <text
+                          x="4"
+                          y="16"
+                          fontSize="4"
+                          className="fill-muted-foreground"
+                        >
+                          60
+                        </text>
+                        <text
+                          x="4"
+                          y="55"
+                          fontSize="4"
+                          className="fill-muted-foreground"
+                        >
+                          30
+                        </text>
+                        <text
+                          x="5"
+                          y="92"
+                          fontSize="4"
+                          className="fill-muted-foreground"
+                        >
+                          0
+                        </text>
+                        <text
+                          x="44"
+                          y="99"
+                          fontSize="4"
+                          className="fill-muted-foreground"
+                        >
+                          X: time samples
+                        </text>
+                        <text
+                          x="1.8"
+                          y="48"
+                          transform="rotate(-90 1.8 48)"
+                          fontSize="4"
+                          className="fill-muted-foreground"
+                        >
+                          Y: degrees
+                        </text>
                       </svg>
                     ) : (
                       <p className="text-sm text-muted-foreground">
@@ -2401,15 +2917,81 @@ export function CrunchCoach() {
                   <div className="rounded-lg border bg-muted/25 p-2">
                     {depthPoints ? (
                       <svg viewBox="0 0 100 100" className="h-40 w-full">
-                        <line x1="10" y1="92" x2="96" y2="92" stroke="currentColor" strokeOpacity="0.35" strokeWidth="0.7" />
-                        <line x1="10" y1="14" x2="10" y2="92" stroke="currentColor" strokeOpacity="0.35" strokeWidth="0.7" />
-                        <line x1="10" y1="53" x2="96" y2="53" stroke="currentColor" strokeOpacity="0.12" strokeWidth="0.6" />
-                        <polyline points={depthPoints} fill="none" stroke="currentColor" strokeWidth="1.7" className="text-cyan-500" />
-                        <text x="4" y="16" fontSize="4" className="fill-muted-foreground">20</text>
-                        <text x="4" y="55" fontSize="4" className="fill-muted-foreground">10</text>
-                        <text x="5" y="92" fontSize="4" className="fill-muted-foreground">0</text>
-                        <text x="44" y="99" fontSize="4" className="fill-muted-foreground">X: time samples</text>
-                        <text x="1.8" y="48" transform="rotate(-90 1.8 48)" fontSize="4" className="fill-muted-foreground">Y: depth %</text>
+                        <line
+                          x1="10"
+                          y1="92"
+                          x2="96"
+                          y2="92"
+                          stroke="currentColor"
+                          strokeOpacity="0.35"
+                          strokeWidth="0.7"
+                        />
+                        <line
+                          x1="10"
+                          y1="14"
+                          x2="10"
+                          y2="92"
+                          stroke="currentColor"
+                          strokeOpacity="0.35"
+                          strokeWidth="0.7"
+                        />
+                        <line
+                          x1="10"
+                          y1="53"
+                          x2="96"
+                          y2="53"
+                          stroke="currentColor"
+                          strokeOpacity="0.12"
+                          strokeWidth="0.6"
+                        />
+                        <polyline
+                          points={depthPoints}
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="1.7"
+                          className="text-cyan-500"
+                        />
+                        <text
+                          x="4"
+                          y="16"
+                          fontSize="4"
+                          className="fill-muted-foreground"
+                        >
+                          20
+                        </text>
+                        <text
+                          x="4"
+                          y="55"
+                          fontSize="4"
+                          className="fill-muted-foreground"
+                        >
+                          10
+                        </text>
+                        <text
+                          x="5"
+                          y="92"
+                          fontSize="4"
+                          className="fill-muted-foreground"
+                        >
+                          0
+                        </text>
+                        <text
+                          x="44"
+                          y="99"
+                          fontSize="4"
+                          className="fill-muted-foreground"
+                        >
+                          X: time samples
+                        </text>
+                        <text
+                          x="1.8"
+                          y="48"
+                          transform="rotate(-90 1.8 48)"
+                          fontSize="4"
+                          className="fill-muted-foreground"
+                        >
+                          Y: depth %
+                        </text>
                       </svg>
                     ) : (
                       <p className="text-sm text-muted-foreground">
@@ -2422,7 +3004,9 @@ export function CrunchCoach() {
 
               <Card>
                 <CardHeader>
-                  <CardTitle className="text-base">Rep pace (seconds)</CardTitle>
+                  <CardTitle className="text-base">
+                    Rep pace (seconds)
+                  </CardTitle>
                 </CardHeader>
                 <CardContent className="flex flex-col gap-3">
                   {repDurations.length > 0 ? (
@@ -2475,10 +3059,12 @@ export function CrunchCoach() {
               </Card>
             </div>
 
-            {(workoutSummary || summaryPending) ? (
+            {workoutSummary || summaryPending ? (
               <Card>
                 <CardHeader>
-                  <CardTitle className="text-base">AI workout summary</CardTitle>
+                  <CardTitle className="text-base">
+                    AI workout summary
+                  </CardTitle>
                 </CardHeader>
                 <CardContent className="space-y-2">
                   <p className="text-xs text-muted-foreground">
@@ -2510,11 +3096,16 @@ export function CrunchCoach() {
                         className="aspect-video w-full object-cover"
                         autoPlay
                         playsInline
-                        muted
+                        muted={isSpeakerMuted}
                         ref={(node) => {
                           if (node && node.srcObject !== feed.stream) {
                             node.srcObject = feed.stream;
+                            node.muted = isSpeakerMuted;
+                            if (!isSpeakerMuted) {
+                              void node.play().catch(() => undefined);
+                            }
                           }
+                          setRemoteVideoRef(feed.deviceId, node);
                         }}
                       />
                       <p className="px-2 py-1 text-xs text-muted-foreground">
