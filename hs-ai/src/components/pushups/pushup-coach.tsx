@@ -73,10 +73,14 @@ const POSE_MIN_VIS = 0.45;
 const MIN_REP_UP_ANGLE = 148;
 const MIN_REP_FRAMES = 2;
 const MIN_HIP_HEIGHT_DELTA = 0.025;
+const MIN_SHOULDER_HEIGHT_DELTA = 0.018;
 const MIN_ELBOW_EXCURSION = 45;
+const MIN_ELBOW_EXCURSION_FRONTAL = 36;
 const ELBOW_ALPHA = 0.42;
 const BODY_ALPHA = 0.22;
 const REP_COOLDOWN_MS = 280;
+const REP_COOLDOWN_MS_FRONTAL = 340;
+const MAX_FRONTAL_ELBOW_ASYMMETRY = 28;
 const SHARE_PUSH_INTERVAL_MS = 100;
 const SHARE_PULL_INTERVAL_MS = 180;
 const SIGNAL_PULL_INTERVAL_MS = 300;
@@ -306,7 +310,7 @@ export function PushupCoach() {
   const [handsDetected, setHandsDetected] = useState(0);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [feedback, setFeedback] = useState<string[]>([
-    "Press Start Camera and begin pushups in profile view.",
+    "Press Start Camera and begin pushups. Side or head-on view both work.",
   ]);
   const [username, setUsername] = useState("");
   const [roomId, setRoomId] = useState("pushups");
@@ -343,6 +347,8 @@ export function PushupCoach() {
   const upFrameCountRef = useRef(0);
   const bottomHipYRef = useRef<number | null>(null);
   const topHipYRef = useRef<number | null>(null);
+  const bottomShoulderYRef = useRef<number | null>(null);
+  const topShoulderYRef = useRef<number | null>(null);
   const elbowEmaRef = useRef<number | null>(null);
   const bodyEmaRef = useRef<number | null>(null);
   const cycleMinElbowRef = useRef<number | null>(null);
@@ -1120,6 +1126,8 @@ export function PushupCoach() {
     upFrameCountRef.current = 0;
     bottomHipYRef.current = null;
     topHipYRef.current = null;
+    bottomShoulderYRef.current = null;
+    topShoulderYRef.current = null;
     elbowEmaRef.current = null;
     bodyEmaRef.current = null;
     cycleMinElbowRef.current = null;
@@ -1274,16 +1282,47 @@ export function PushupCoach() {
     const right = getSideMetrics(landmarks, "right");
     const side = left.quality >= right.quality ? left : right;
 
-    if (!side.valid) {
+    const leftShoulder = landmarks[SHOULDER_L];
+    const rightShoulder = landmarks[SHOULDER_R];
+    const leftElbow = landmarks[ELBOW_L];
+    const rightElbow = landmarks[ELBOW_R];
+    const leftWrist = landmarks[WRIST_L];
+    const rightWrist = landmarks[WRIST_R];
+    const leftHip = landmarks[HIP_L];
+    const rightHip = landmarks[HIP_R];
+
+    const frontalReady =
+      isVisible(leftShoulder) &&
+      isVisible(rightShoulder) &&
+      isVisible(leftElbow) &&
+      isVisible(rightElbow) &&
+      isVisible(leftWrist) &&
+      isVisible(rightWrist);
+
+    if (!side.valid && !frontalReady) {
       setStatusText("Low landmark confidence. Keep full body in frame.");
       setFeedback([
-        "Move slightly farther from the camera and keep side view visible.",
+        "Move slightly farther from the camera and keep your upper body clearly visible.",
       ]);
       return;
     }
 
+    const leftElbowAngle =
+      frontalReady && leftShoulder && leftElbow && leftWrist
+        ? angleABC(leftShoulder, leftElbow, leftWrist)
+        : side.elbowAngle;
+    const rightElbowAngle =
+      frontalReady && rightShoulder && rightElbow && rightWrist
+        ? angleABC(rightShoulder, rightElbow, rightWrist)
+        : side.elbowAngle;
+    const elbowAsymmetry = Math.abs(leftElbowAngle - rightElbowAngle);
+    const frontalMode = frontalReady && elbowAsymmetry <= MAX_FRONTAL_ELBOW_ASYMMETRY;
+    const rawElbowAngle = frontalMode
+      ? (leftElbowAngle + rightElbowAngle) / 2
+      : side.elbowAngle;
+
     const smoothedElbow = ema(
-      side.elbowAngle,
+      rawElbowAngle,
       elbowEmaRef.current,
       ELBOW_ALPHA,
     );
@@ -1304,10 +1343,6 @@ export function PushupCoach() {
       cycleMaxElbowRef.current = smoothedElbow;
     }
 
-    const leftHip = landmarks[HIP_L];
-    const rightHip = landmarks[HIP_R];
-    const leftShoulder = landmarks[SHOULDER_L];
-    const rightShoulder = landmarks[SHOULDER_R];
     const shoulderWidth =
       isVisible(leftShoulder) && isVisible(rightShoulder)
         ? distance2D(leftShoulder!, rightShoulder!)
@@ -1318,10 +1353,20 @@ export function PushupCoach() {
         : side === left
           ? (leftHip?.y ?? 0.5)
           : (rightHip?.y ?? 0.5);
+    const shoulderY =
+      isVisible(leftShoulder) && isVisible(rightShoulder)
+        ? (leftShoulder!.y + rightShoulder!.y) / 2
+        : hipY;
 
     if (stageRef.current === "up") {
       if (topHipYRef.current === null || hipY < topHipYRef.current) {
         topHipYRef.current = hipY;
+      }
+      if (
+        topShoulderYRef.current === null ||
+        shoulderY < topShoulderYRef.current
+      ) {
+        topShoulderYRef.current = shoulderY;
       }
       if (smoothedElbow > 140) {
         upAngleBaselineRef.current = ema(
@@ -1335,6 +1380,12 @@ export function PushupCoach() {
       if (bottomHipYRef.current === null || hipY > bottomHipYRef.current) {
         bottomHipYRef.current = hipY;
       }
+      if (
+        bottomShoulderYRef.current === null ||
+        shoulderY > bottomShoulderYRef.current
+      ) {
+        bottomShoulderYRef.current = shoulderY;
+      }
     }
 
     const upThreshold = clamp(
@@ -1342,7 +1393,7 @@ export function PushupCoach() {
       142,
       170,
     );
-    const downThreshold = clamp(upThreshold - 48, 90, 122);
+    const downThreshold = clamp(upThreshold - (frontalMode ? 44 : 48), 90, 124);
 
     const isDownNow = smoothedElbow <= downThreshold;
     const isUpNow = smoothedElbow >= upThreshold;
@@ -1365,6 +1416,7 @@ export function PushupCoach() {
     ) {
       stageRef.current = "down";
       bottomHipYRef.current = hipY;
+      bottomShoulderYRef.current = shoulderY;
       downStartedAtRef.current = performance.now();
     }
 
@@ -1377,6 +1429,11 @@ export function PushupCoach() {
       const depthTravel = bottomHip - topHip;
       const normalizedDepth =
         shoulderWidth > 0 ? depthTravel / shoulderWidth : 0;
+      const topShoulder = topShoulderYRef.current ?? shoulderY;
+      const bottomShoulder = bottomShoulderYRef.current ?? shoulderY;
+      const shoulderDepthTravel = bottomShoulder - topShoulder;
+      const normalizedShoulderDepth =
+        shoulderWidth > 0 ? shoulderDepthTravel / shoulderWidth : 0;
       const elbowExcursion =
         (cycleMaxElbowRef.current ?? smoothedElbow) -
         (cycleMinElbowRef.current ?? smoothedElbow);
@@ -1384,12 +1441,23 @@ export function PushupCoach() {
       const downDurationMs = downStartedAtRef.current
         ? now - downStartedAtRef.current
         : 0;
-      const cooldownPassed = now - lastRepAtRef.current >= REP_COOLDOWN_MS;
-      const depthOk = normalizedDepth >= MIN_HIP_HEIGHT_DELTA;
-      const excursionOk = elbowExcursion >= MIN_ELBOW_EXCURSION;
-      const downHeldEnough = downDurationMs >= 80;
+      const cooldownPassed =
+        now - lastRepAtRef.current >=
+        (frontalMode ? REP_COOLDOWN_MS_FRONTAL : REP_COOLDOWN_MS);
+      const depthOk = frontalMode
+        ? normalizedShoulderDepth >= MIN_SHOULDER_HEIGHT_DELTA
+        : normalizedDepth >= MIN_HIP_HEIGHT_DELTA;
+      const excursionOk = elbowExcursion >=
+        (frontalMode ? MIN_ELBOW_EXCURSION_FRONTAL : MIN_ELBOW_EXCURSION);
+      const downHeldEnough = downDurationMs >= (frontalMode ? 110 : 80);
+      const symmetryOk = !frontalMode || elbowAsymmetry <= MAX_FRONTAL_ELBOW_ASYMMETRY;
 
-      if (cooldownPassed && downHeldEnough && (depthOk || excursionOk)) {
+      if (
+        cooldownPassed &&
+        downHeldEnough &&
+        symmetryOk &&
+        ((depthOk && excursionOk) || (!frontalMode && (depthOk || excursionOk)))
+      ) {
         setRepCount((p) => p + 1);
         const repNow = Date.now();
         setRepTimestamps((prev) => [...prev, repNow].slice(-200));
@@ -1399,7 +1467,9 @@ export function PushupCoach() {
 
       stageRef.current = "up";
       topHipYRef.current = hipY;
+      topShoulderYRef.current = shoulderY;
       bottomHipYRef.current = null;
+      bottomShoulderYRef.current = null;
       cycleMinElbowRef.current = smoothedElbow;
       cycleMaxElbowRef.current = smoothedElbow;
       downStartedAtRef.current = null;
@@ -1437,6 +1507,11 @@ export function PushupCoach() {
     if (smoothedElbow > 110 && stageRef.current === "down") {
       score -= clamp((smoothedElbow - 110) * 0.9, 0, 20);
       nextFeedback.push("Go deeper at the bottom before pressing up.");
+    }
+
+    if (frontalReady && elbowAsymmetry > MAX_FRONTAL_ELBOW_ASYMMETRY) {
+      score -= clamp((elbowAsymmetry - MAX_FRONTAL_ELBOW_ASYMMETRY) * 0.8, 0, 15);
+      nextFeedback.push("Keep both elbows moving together to improve front-view count accuracy.");
     }
 
     if (nextFeedback.length === 0) {
@@ -1619,6 +1694,8 @@ export function PushupCoach() {
           upFrameCountRef.current = 0;
           bottomHipYRef.current = null;
           topHipYRef.current = null;
+          bottomShoulderYRef.current = null;
+          topShoulderYRef.current = null;
           elbowEmaRef.current = null;
           bodyEmaRef.current = null;
           cycleMinElbowRef.current = null;
@@ -1632,7 +1709,7 @@ export function PushupCoach() {
           setQualityScore(0);
           setFormHistory([]);
           setFeedback([
-            "Camera started. Hold side view and begin controlled reps.",
+            "Camera started. Side or head-on view works. Begin controlled reps.",
           ]);
           setIsCameraOn(true);
           setStatusText("Camera active");
