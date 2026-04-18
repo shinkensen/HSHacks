@@ -181,6 +181,7 @@ export default function Home() {
   const [remoteMediaFeeds, setRemoteMediaFeeds] = useState<RemoteMediaFeed[]>([])
   const [roomJoinState, setRoomJoinState] = useState<RoomJoinState>('idle')
   const [roomProgressText, setRoomProgressText] = useState('Not connected to a room yet.')
+  const [showShareCameraAlert, setShowShareCameraAlert] = useState(false)
 
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
@@ -211,6 +212,7 @@ export default function Home() {
   const signalPollTimerRef = useRef<number | null>(null)
   const signalCursorRef = useRef(0)
   const peerConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map())
+  const shareAlertTimerRef = useRef<number | null>(null)
 
   function formatDuration(totalSeconds: number) {
     const minutes = Math.floor(totalSeconds / 60)
@@ -648,6 +650,11 @@ export default function Home() {
       streamRef.current.getTracks().forEach((track) => track.stop())
       streamRef.current = null
     }
+    if (shareAlertTimerRef.current !== null) {
+      window.clearTimeout(shareAlertTimerRef.current)
+      shareAlertTimerRef.current = null
+    }
+    setShowShareCameraAlert(false)
     void sendSignal('leave').catch(() => undefined)
     stopSignalPolling()
     closeAllPeers()
@@ -1091,6 +1098,14 @@ export default function Home() {
           setFeedback(['Camera started. Hold side view and begin controlled reps.'])
           setIsCameraOn(true)
           setStatusText('Camera active')
+          setShowShareCameraAlert(true)
+          if (shareAlertTimerRef.current !== null) {
+            window.clearTimeout(shareAlertTimerRef.current)
+          }
+          shareAlertTimerRef.current = window.setTimeout(() => {
+            setShowShareCameraAlert(false)
+            shareAlertTimerRef.current = null
+          }, 4000)
           startTimer()
           lastVideoTimeRef.current = -1
           await attachTracksAndRenegotiate()
@@ -1111,6 +1126,11 @@ export default function Home() {
         <div className="video-container">
           <video ref={videoRef} className="camera-feed" playsInline muted />
           <canvas ref={canvasRef} className="overlay-canvas" />
+          {showShareCameraAlert && (
+            <div className="absolute left-1/2 top-3 z-30 -translate-x-1/2 rounded-md border border-amber-300/60 bg-amber-500/15 px-3 py-2 text-xs text-amber-100 backdrop-blur-sm">
+              Camera feed is shared with other participants in this room.
+            </div>
+          )}
           <div className="absolute right-3 top-3 z-20 w-52 rounded-md border border-emerald-400/40 bg-black/55 p-2 backdrop-blur-sm pointer-events-none">
             <p className="text-[11px] uppercase tracking-wide text-emerald-300">Leaderboard</p>
             <div className="mt-1 space-y-1">
