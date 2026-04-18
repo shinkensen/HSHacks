@@ -1,6 +1,10 @@
 import { NextResponse } from "next/server";
 import { auth } from "@clerk/nextjs/server";
 
+import {
+  finalizeSelectedDaySessions,
+  reducePushupDayStats,
+} from "@/lib/pushup-calendar";
 import { queryConvex } from "@/lib/convex-server";
 
 type CalendarResponse = {
@@ -58,7 +62,17 @@ export async function GET(request: Request) {
         selectedDayTs,
       },
     );
-    return NextResponse.json(insights);
+
+    const selectedDaySessions = finalizeSelectedDaySessions(
+      insights.selectedDaySessions,
+    );
+    const selectedDayStats = reducePushupDayStats(selectedDaySessions);
+
+    return NextResponse.json({
+      ...insights,
+      selectedDaySessions,
+      selectedDayStats,
+    });
   } catch {
     return NextResponse.json(
       {

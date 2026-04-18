@@ -1656,20 +1656,27 @@ export function PushupCoach() {
   }
 
   return (
-    <main className="flex min-h-0 flex-1">
-      <div className="mx-auto flex w-full max-w-7xl flex-col gap-6 p-6">
-        <header className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
-          <div className="flex flex-col gap-2">
-            <h1 className="text-3xl font-semibold tracking-tight sm:text-4xl">
+    <main className="flex min-h-0 min-w-0 max-w-full flex-1 overflow-x-hidden">
+      <div className="mx-auto flex w-full min-w-0 max-w-7xl flex-col gap-3 px-2 py-3 sm:gap-5 sm:px-4 sm:py-4 md:gap-6 md:px-6">
+        <header className="flex flex-col gap-2.5 sm:flex-row sm:items-end sm:justify-between sm:gap-3">
+          <div className="min-w-0 flex flex-col gap-1 sm:gap-2">
+            <h2 className="hidden text-2xl font-semibold tracking-tight md:block lg:text-3xl xl:text-4xl">
               Pushup Coach
-            </h1>
-            <p className="text-sm text-muted-foreground">{statusText}</p>
+            </h2>
+            <p className="text-xs leading-relaxed text-muted-foreground sm:text-sm">
+              {statusText}
+            </p>
           </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <Button onClick={startCamera} disabled={isCameraOn}>
+          <div className="flex w-full flex-wrap items-stretch gap-2 sm:w-auto sm:items-center">
+            <Button
+              className="min-h-9 flex-1 sm:flex-initial"
+              onClick={startCamera}
+              disabled={isCameraOn}
+            >
               Start camera
             </Button>
             <Button
+              className="min-h-9 flex-1 sm:flex-initial"
               onClick={stopCamera}
               variant="destructive"
               disabled={!isCameraOn}
@@ -1679,12 +1686,116 @@ export function PushupCoach() {
           </div>
         </header>
 
-        <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_22rem]">
-          <section className="flex flex-col gap-6">
+        <div className="grid gap-3 sm:gap-4 lg:grid-cols-3">
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-base">Goal tracker</CardTitle>
+            </CardHeader>
+            <CardContent className="flex flex-col gap-3">
+              <FieldGroup>
+                <Field>
+                  <FieldLabel htmlFor="target-reps">Target reps</FieldLabel>
+                  <Input
+                    id="target-reps"
+                    type="number"
+                    min={1}
+                    max={999}
+                    value={targetReps}
+                    onChange={(event) => {
+                      const value = Number(event.target.value);
+                      if (!Number.isFinite(value)) return;
+                      setTargetReps(clamp(Math.floor(value), 1, 999));
+                    }}
+                  />
+                </Field>
+              </FieldGroup>
+              <Progress value={goalProgress}>
+                <ProgressLabel>Goal progress</ProgressLabel>
+                <ProgressValue />
+              </Progress>
+              <p className="text-xs text-muted-foreground">
+                {repCount}/{targetReps} reps complete.
+              </p>
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-base">Room relay</CardTitle>
+            </CardHeader>
+            <CardContent className="flex flex-col gap-3">
+              <p className="text-xs text-muted-foreground">
+                Signed in as {normalizeUsername(username)}.
+              </p>
+              <FieldGroup>
+                <Field>
+                  <FieldLabel htmlFor="pushup-room-name">Room name</FieldLabel>
+                  <Input
+                    id="pushup-room-name"
+                    value={roomId}
+                    onChange={(event) =>
+                      setRoomId(normalizeRoomId(event.target.value))
+                    }
+                  />
+                </Field>
+              </FieldGroup>
+              <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap">
+                <Button
+                  className="w-full sm:w-auto"
+                  onClick={createRoom}
+                  disabled={
+                    roomJoinState === "creating" || roomJoinState === "joining"
+                  }
+                >
+                  {roomJoinState === "creating" ? "Creating..." : "Create room"}
+                </Button>
+                <Button
+                  className="w-full sm:w-auto"
+                  variant="outline"
+                  onClick={joinRoom}
+                  disabled={
+                    roomJoinState === "creating" || roomJoinState === "joining"
+                  }
+                >
+                  {roomJoinState === "joining" ? "Joining..." : "Join room"}
+                </Button>
+              </div>
+              <p className="text-xs text-muted-foreground">
+                {roomProgressText}
+              </p>
+            </CardContent>
+          </Card>
+
+          <Card className="h-full">
+            <CardHeader>
+              <CardTitle className="text-base">Session patterns</CardTitle>
+            </CardHeader>
+            <CardContent className="flex h-48 flex-col gap-2 overflow-y-auto pr-1">
+              {repTimestamps.slice(-12).length > 0 ? (
+                repTimestamps.slice(-12).map((timestamp, index, entries) => (
+                  <div
+                    key={`${timestamp}-${index}`}
+                    className="flex items-center justify-between rounded-md bg-muted px-2 py-1 text-xs"
+                  >
+                    <span>Rep {repCount - (entries.length - index - 1)}</span>
+                    <span>{new Date(timestamp).toLocaleTimeString()}</span>
+                  </div>
+                ))
+              ) : (
+                <p className="text-xs text-muted-foreground">
+                  Rep history appears after first completed rep.
+                </p>
+              )}
+            </CardContent>
+          </Card>
+        </div>
+
+        <div className="grid gap-3 sm:gap-5">
+          <div className="flex min-w-0 flex-col gap-3 sm:gap-5">
             <Card className="overflow-hidden border-border/70">
-              <CardHeader className="pb-3">
-                <CardTitle className="text-base">
-                  Live form capture + multiplayer overlay
+              <CardHeader className="space-y-0 pb-2 sm:pb-3">
+                <CardTitle className="text-sm font-medium leading-snug sm:text-base">
+                  Live capture + multiplayer
                 </CardTitle>
               </CardHeader>
               <CardContent className="flex flex-col gap-3">
@@ -1704,14 +1815,14 @@ export function PushupCoach() {
                       Camera feed shared with room participants.
                     </div>
                   ) : null}
-                  <div className="pointer-events-none absolute right-3 top-3 z-20 flex w-56 flex-col gap-1 rounded-lg border bg-background/90 p-2 backdrop-blur">
-                    <p className="text-[11px] uppercase tracking-wide text-muted-foreground">
+                  <div className="pointer-events-none absolute right-1.5 top-1.5 z-20 flex max-w-[min(100%,14rem)] flex-col gap-0.5 rounded-md border bg-background/90 p-1.5 backdrop-blur sm:right-3 sm:top-3 sm:max-w-none sm:w-56 sm:gap-1 sm:p-2">
+                    <p className="text-[9px] uppercase tracking-wide text-muted-foreground sm:text-[11px]">
                       Leaderboard
                     </p>
                     {leaderboard.slice(0, 5).map((entry, index) => (
                       <div
                         key={entry.deviceId}
-                        className="flex items-center justify-between rounded bg-muted px-2 py-1 text-xs"
+                        className="flex items-center justify-between rounded bg-muted px-1.5 py-0.5 text-[10px] sm:px-2 sm:py-1 sm:text-xs"
                       >
                         <span className="truncate pr-2">
                           #{index + 1} {entry.username}
@@ -1725,62 +1836,71 @@ export function PushupCoach() {
               </CardContent>
             </Card>
 
-            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
-              <Card className="bg-muted/25">
-                <CardHeader>
-                  <CardTitle className="text-xs text-muted-foreground">
-                    Form score
+            <div className="flex snap-x snap-mandatory gap-2 overflow-x-auto py-0.5 [-ms-overflow-style:none] [scrollbar-width:none] sm:grid sm:snap-none sm:grid-cols-2 sm:gap-3 sm:overflow-visible sm:py-0 md:grid-cols-3 md:gap-4 lg:grid-cols-5 lg:snap-none [&::-webkit-scrollbar]:hidden">
+              <Card className="min-w-[42%] shrink-0 snap-start bg-muted/25 sm:min-w-0">
+                <CardHeader className="p-2 pb-0 sm:p-3 sm:pb-0">
+                  <CardTitle className="text-[10px] text-muted-foreground sm:text-xs">
+                    Form
                   </CardTitle>
                 </CardHeader>
-                <CardContent>
-                  <p className="text-2xl font-semibold">{qualityScore}</p>
+                <CardContent className="p-2 pt-1 sm:p-6 sm:pt-2">
+                  <p className="text-lg font-semibold tabular-nums sm:text-2xl">
+                    {qualityScore}
+                  </p>
                 </CardContent>
               </Card>
-              <Card className="bg-muted/25">
-                <CardHeader>
-                  <CardTitle className="text-xs text-muted-foreground">
+              <Card className="min-w-[42%] shrink-0 snap-start bg-muted/25 sm:min-w-0">
+                <CardHeader className="p-2 pb-0 sm:p-3 sm:pb-0">
+                  <CardTitle className="text-[10px] text-muted-foreground sm:text-xs">
                     Reps
                   </CardTitle>
                 </CardHeader>
-                <CardContent>
-                  <p className="text-2xl font-semibold">{repCount}</p>
+                <CardContent className="p-2 pt-1 sm:p-6 sm:pt-2">
+                  <p className="text-lg font-semibold tabular-nums sm:text-2xl">
+                    {repCount}
+                  </p>
                 </CardContent>
               </Card>
-              <Card className="bg-muted/25">
-                <CardHeader>
-                  <CardTitle className="text-xs text-muted-foreground">
-                    Timer
+              <Card className="min-w-[42%] shrink-0 snap-start bg-muted/25 sm:min-w-0">
+                <CardHeader className="p-2 pb-0 sm:p-3 sm:pb-0">
+                  <CardTitle className="text-[10px] text-muted-foreground sm:text-xs">
+                    Time
                   </CardTitle>
                 </CardHeader>
-                <CardContent>
-                  <p className="text-2xl font-semibold">
+                <CardContent className="p-2 pt-1 sm:p-6 sm:pt-2">
+                  <p className="text-lg font-semibold tabular-nums sm:text-2xl">
                     {formatDuration(elapsedSeconds)}
                   </p>
                 </CardContent>
               </Card>
-              <Card className="bg-muted/25">
-                <CardHeader>
-                  <CardTitle className="text-xs text-muted-foreground">
+              <Card className="min-w-[42%] shrink-0 snap-start bg-muted/25 sm:min-w-0">
+                <CardHeader className="p-2 pb-0 sm:p-3 sm:pb-0">
+                  <CardTitle className="text-[10px] text-muted-foreground sm:text-xs">
                     Hands
                   </CardTitle>
                 </CardHeader>
-                <CardContent>
-                  <p className="text-2xl font-semibold">{handsDetected}</p>
+                <CardContent className="p-2 pt-1 sm:p-6 sm:pt-2">
+                  <p className="text-lg font-semibold tabular-nums sm:text-2xl">
+                    {handsDetected}
+                  </p>
                 </CardContent>
               </Card>
-              <Card className="bg-muted/25">
-                <CardHeader>
-                  <CardTitle className="text-xs text-muted-foreground">
-                    Calories est.
+              <Card className="min-w-[42%] shrink-0 snap-start bg-muted/25 sm:min-w-0">
+                <CardHeader className="p-2 pb-0 sm:p-3 sm:pb-0">
+                  <CardTitle className="text-[10px] text-muted-foreground sm:text-xs">
+                    Cal est.
                   </CardTitle>
                 </CardHeader>
-                <CardContent>
-                  <p className="text-2xl font-semibold">{calorieEstimate}</p>
+                <CardContent className="p-2 pt-1 sm:p-6 sm:pt-2">
+                  <p className="text-lg font-semibold tabular-nums sm:text-2xl">
+                    {calorieEstimate}
+                  </p>
                 </CardContent>
               </Card>
             </div>
-
-            <div className="grid gap-4 lg:grid-cols-2">
+          </div>
+          <div className="flex min-w-0 flex-col gap-3 sm:gap-5">
+            <div className="grid gap-3 sm:gap-4 lg:grid-cols-2">
               <Card>
                 <CardHeader>
                   <CardTitle className="text-base">Form history</CardTitle>
@@ -1891,118 +2011,7 @@ export function PushupCoach() {
                 ))}
               </CardContent>
             </Card>
-          </section>
-
-          <aside className="flex flex-col gap-4">
-            <Card>
-              <CardHeader>
-                <CardTitle className="text-base">Goal tracker</CardTitle>
-              </CardHeader>
-              <CardContent className="flex flex-col gap-3">
-                <FieldGroup>
-                  <Field>
-                    <FieldLabel htmlFor="target-reps">Target reps</FieldLabel>
-                    <Input
-                      id="target-reps"
-                      type="number"
-                      min={1}
-                      max={999}
-                      value={targetReps}
-                      onChange={(event) => {
-                        const value = Number(event.target.value);
-                        if (!Number.isFinite(value)) return;
-                        setTargetReps(clamp(Math.floor(value), 1, 999));
-                      }}
-                    />
-                  </Field>
-                </FieldGroup>
-                <Progress value={goalProgress}>
-                  <ProgressLabel>Goal progress</ProgressLabel>
-                  <ProgressValue />
-                </Progress>
-                <p className="text-xs text-muted-foreground">
-                  {repCount}/{targetReps} reps complete.
-                </p>
-              </CardContent>
-            </Card>
-
-            <Card>
-              <CardHeader>
-                <CardTitle className="text-base">Room relay</CardTitle>
-              </CardHeader>
-              <CardContent className="flex flex-col gap-3">
-                <p className="text-xs text-muted-foreground">
-                  Signed in as {normalizeUsername(username)}.
-                </p>
-                <FieldGroup>
-                  <Field>
-                    <FieldLabel htmlFor="pushup-room-name">
-                      Room name
-                    </FieldLabel>
-                    <Input
-                      id="pushup-room-name"
-                      value={roomId}
-                      onChange={(event) =>
-                        setRoomId(normalizeRoomId(event.target.value))
-                      }
-                    />
-                  </Field>
-                </FieldGroup>
-                <div className="flex flex-wrap gap-2">
-                  <Button
-                    onClick={createRoom}
-                    disabled={
-                      roomJoinState === "creating" ||
-                      roomJoinState === "joining"
-                    }
-                  >
-                    {roomJoinState === "creating"
-                      ? "Creating..."
-                      : "Create room"}
-                  </Button>
-                  <Button
-                    variant="outline"
-                    onClick={joinRoom}
-                    disabled={
-                      roomJoinState === "creating" ||
-                      roomJoinState === "joining"
-                    }
-                  >
-                    {roomJoinState === "joining" ? "Joining..." : "Join room"}
-                  </Button>
-                </div>
-                <p className="text-xs text-muted-foreground">
-                  {roomProgressText}
-                </p>
-                <p className="text-xs text-muted-foreground">
-                  Device ID: {ensureDeviceId()}
-                </p>
-              </CardContent>
-            </Card>
-
-            <Card>
-              <CardHeader>
-                <CardTitle className="text-base">Session patterns</CardTitle>
-              </CardHeader>
-              <CardContent className="flex flex-col gap-2">
-                {repTimestamps.slice(-12).length > 0 ? (
-                  repTimestamps.slice(-12).map((timestamp, index, entries) => (
-                    <div
-                      key={`${timestamp}-${index}`}
-                      className="flex items-center justify-between rounded-md bg-muted px-2 py-1 text-xs"
-                    >
-                      <span>Rep {repCount - (entries.length - index - 1)}</span>
-                      <span>{new Date(timestamp).toLocaleTimeString()}</span>
-                    </div>
-                  ))
-                ) : (
-                  <p className="text-xs text-muted-foreground">
-                    Rep history appears after first completed rep.
-                  </p>
-                )}
-              </CardContent>
-            </Card>
-          </aside>
+          </div>
         </div>
       </div>
     </main>

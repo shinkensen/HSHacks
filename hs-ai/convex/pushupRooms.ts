@@ -65,6 +65,14 @@ function caloriesFromReps(reps: number): number {
   return Number((Math.max(0, reps) * CALORIES_PER_REP).toFixed(1));
 }
 
+/** Rows with 0 reps are usually room presence / join pings, not workouts. */
+const MEANINGFUL_MIN_REPS = 1;
+const MAX_WORKOUTS_IN_DAY_LIST = 10;
+
+function isCountedWorkoutSession(session: { maxReps: number }): boolean {
+  return session.maxReps >= MEANINGFUL_MIN_REPS;
+}
+
 function sanitizeLandmarkList(
   landmarks: Array<{ x: number; y: number; z: number; visibility: number | null }>,
   maxCount: number,
@@ -439,7 +447,7 @@ export const getCalendarInsights = query({
       : Date.now();
     const selectedDayKey = dayKeyFromTimestamp(selectedTs);
 
-    const selectedDaySessions = await ctx.db
+    const selectedDaySessionsRaw = await ctx.db
       .query("pushupSessions")
       .withIndex("by_userId_and_dayKey", (q) =>
         q.eq("userId", userId).eq("dayKey", selectedDayKey),
@@ -447,13 +455,18 @@ export const getCalendarInsights = query({
       .order("desc")
       .take(200);
 
+    const selectedDaySessions = selectedDaySessionsRaw
+      .filter(isCountedWorkoutSession)
+      .sort((a, b) => b.updatedAt - a.updatedAt)
+      .slice(0, MAX_WORKOUTS_IN_DAY_LIST);
+
     const now = Date.now();
     const weekStart = new Date(selectedTs);
     weekStart.setDate(weekStart.getDate() - 6);
     const weekStartKey = dayKeyFromTimestamp(weekStart.getTime());
     const todayKey = dayKeyFromTimestamp(now);
 
-    const weeklySessions = await ctx.db
+    const weeklySessionsRaw = await ctx.db
       .query("pushupSessions")
       .withIndex("by_userId_and_dayKey", (q) =>
         q
@@ -462,6 +475,8 @@ export const getCalendarInsights = query({
           .lte("dayKey", todayKey),
       )
       .take(500);
+
+    const weeklySessions = weeklySessionsRaw.filter(isCountedWorkoutSession);
 
     const recentWindowStart = new Date(now);
     recentWindowStart.setDate(recentWindowStart.getDate() - 180);
@@ -478,6 +493,7 @@ export const getCalendarInsights = query({
       { dayKey: string; workouts: number; totalReps: number; calories: number }
     >();
     for (const session of recentSessions) {
+      if (!isCountedWorkoutSession(session)) continue;
       const item = calendarMap.get(session.dayKey) ?? {
         dayKey: session.dayKey,
         workouts: 0,

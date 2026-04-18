@@ -6,7 +6,21 @@ import { useQuery } from "convex/react";
 import { usePathname, useRouter } from "next/navigation";
 
 import { api } from "@/lib/convex-api";
+import {
+  finalizeSelectedDaySessions,
+  reducePushupDayStats,
+  type PushupCalendarSession,
+  type PushupStats,
+} from "@/lib/pushup-calendar";
 import { Calendar } from "@/components/ui/calendar";
+import { Button } from "@/components/ui/button";
+import {
+  Sheet,
+  SheetContent,
+  SheetDescription,
+  SheetHeader,
+  SheetTitle,
+} from "@/components/ui/sheet";
 import {
   Sidebar,
   SidebarContent,
@@ -36,22 +50,7 @@ type DaySummary = {
   stepsCompleted: number;
 };
 
-type PushupSessionItem = {
-  _id: string;
-  roomId: string;
-  username: string;
-  startedAt: number;
-  endedAt: number | null;
-  maxReps: number;
-  caloriesEstimate: number;
-};
-
-type PushupStats = {
-  workouts: number;
-  totalReps: number;
-  calories: number;
-  minutes: number;
-};
+type PushupSessionItem = PushupCalendarSession;
 
 function formatShortDate(timestamp: number): string {
   return new Date(timestamp).toLocaleDateString(undefined, {
@@ -202,7 +201,7 @@ function AppSidebarLeft({
   );
 }
 
-function AppSidebarRight({
+function InsightsSidebarBody({
   mode,
   selectedDate,
   onSelectedDateChange,
@@ -236,81 +235,102 @@ function AppSidebarRight({
   const router = useRouter();
 
   return (
-    <Sidebar
-      side="right"
-      collapsible="none"
-      className="hidden w-96 border-l xl:flex"
-    >
-      <SidebarHeader className="px-3 pt-4 pb-2">
-        <p className="px-2 text-sm font-medium">Weekly view</p>
+    <>
+      <SidebarHeader className="px-2 pb-2 pt-3 sm:px-3 sm:pt-4">
+        <p className="px-1 text-xs font-medium sm:px-2 sm:text-sm">Weekly view</p>
       </SidebarHeader>
-      <SidebarContent className="pb-4">
-        <SidebarGroup className="px-1">
-          <SidebarGroupLabel>Calendar</SidebarGroupLabel>
-          <SidebarGroupContent className="px-2 pb-2">
-            <Calendar
-              mode="single"
-              selected={selectedDate}
-              onSelect={onSelectedDateChange}
-              className="mx-auto [--cell-size:2.3rem]"
-              modifiers={{
-                active: (day) => activeDaySet.has(day.toISOString().slice(0, 10)),
-              }}
-              modifiersClassNames={{
-                active: "font-semibold text-primary",
-              }}
-            />
-            <p className="px-2 pt-2 text-xs text-muted-foreground">
+      <SidebarContent className="max-h-[min(100dvh,100vh)] overflow-y-auto overscroll-contain pb-4">
+        <SidebarGroup className="px-0 sm:px-1">
+          <SidebarGroupLabel className="px-2">Calendar</SidebarGroupLabel>
+          <SidebarGroupContent className="min-w-0 w-full max-w-full px-1 pb-2 sm:px-2">
+            <div className="w-full min-w-0 max-w-full overflow-hidden rounded-md border border-border/30 bg-muted/15 px-0.5 py-1">
+              <Calendar
+                mode="single"
+                selected={selectedDate}
+                onSelect={onSelectedDateChange}
+                className="w-full min-w-0 max-w-full bg-transparent p-1 [--cell-size:1.85rem] lg:[--cell-size:2rem]"
+                classNames={{
+                  nav: "px-0.5",
+                  button_previous: "size-7 [&_svg]:size-3.5",
+                  button_next: "size-7 [&_svg]:size-3.5",
+                  month_caption: "px-6 text-xs sm:text-sm",
+                  caption_label: "text-xs font-medium sm:text-sm",
+                }}
+                modifiers={{
+                  active: (day) => activeDaySet.has(day.toISOString().slice(0, 10)),
+                }}
+                modifiersClassNames={{
+                  active: "font-semibold text-primary",
+                }}
+              />
+            </div>
+            <p className="truncate px-1 pt-2 text-[11px] text-muted-foreground sm:text-xs">
               Selected: {formatSelectedDay(selectedDate)}
             </p>
           </SidebarGroupContent>
         </SidebarGroup>
         <SidebarSeparator />
-        <SidebarGroup className="px-1">
-          <SidebarGroupLabel>Selected Day</SidebarGroupLabel>
-          <SidebarGroupContent className="space-y-1 px-4 text-sm">
+        <SidebarGroup className="px-0 sm:px-1">
+          <SidebarGroupLabel className="px-2">Selected Day</SidebarGroupLabel>
+          <SidebarGroupContent className="grid grid-cols-2 gap-x-2 gap-y-1 px-2 text-[11px] leading-snug sm:px-3 sm:text-xs sm:leading-normal">
             {mode === "pushups" ? (
               <>
-                <p>Workouts: {selectedPushupSummary.workouts}</p>
-                <p>Total reps: {selectedPushupSummary.totalReps}</p>
-                <p>Calories est: {selectedPushupSummary.calories}</p>
-                <p>Duration: {selectedPushupSummary.minutes} min</p>
+                <p className="col-span-2 text-muted-foreground">Workouts</p>
+                <p className="col-span-2 font-medium tabular-nums text-foreground">
+                  {selectedPushupSummary.workouts}
+                </p>
+                <p className="text-muted-foreground">Reps</p>
+                <p className="text-right tabular-nums">{selectedPushupSummary.totalReps}</p>
+                <p className="text-muted-foreground">Cal</p>
+                <p className="text-right tabular-nums">{selectedPushupSummary.calories}</p>
+                <p className="text-muted-foreground">Time</p>
+                <p className="text-right tabular-nums">{selectedPushupSummary.minutes}m</p>
               </>
             ) : (
-              <>
+              <div className="col-span-2 flex flex-col gap-1 text-xs sm:text-sm">
                 <p>Sessions: {selectedDaySummary.sessions}</p>
                 <p>Steps done: {selectedDaySummary.stepsCompleted}</p>
-              </>
+              </div>
             )}
           </SidebarGroupContent>
         </SidebarGroup>
         <SidebarSeparator />
-        <SidebarGroup className="px-1">
-          <SidebarGroupLabel>Last 7 Days</SidebarGroupLabel>
-          <SidebarGroupContent className="space-y-1 px-4 text-sm">
+        <SidebarGroup className="px-0 sm:px-1">
+          <SidebarGroupLabel className="px-2">Last 7 Days</SidebarGroupLabel>
+          <SidebarGroupContent className="grid grid-cols-2 gap-x-2 gap-y-1 px-2 text-[11px] leading-snug sm:px-3 sm:text-xs sm:leading-normal">
             {mode === "pushups" ? (
               <>
-                <p>Workouts: {weeklyPushups.workouts}</p>
-                <p>Total reps: {weeklyPushups.totalReps}</p>
-                <p>Calories est: {weeklyPushups.calories}</p>
-                <p>Duration: {weeklyPushups.minutes} min</p>
+                <p className="col-span-2 text-muted-foreground">Workouts</p>
+                <p className="col-span-2 font-medium tabular-nums">
+                  {weeklyPushups.workouts}
+                </p>
+                <p className="text-muted-foreground">Reps</p>
+                <p className="text-right tabular-nums">{weeklyPushups.totalReps}</p>
+                <p className="text-muted-foreground">Cal</p>
+                <p className="text-right tabular-nums">{weeklyPushups.calories}</p>
+                <p className="text-muted-foreground">Time</p>
+                <p className="text-right tabular-nums">{weeklyPushups.minutes}m</p>
               </>
             ) : (
-              <>
+              <div className="col-span-2 flex flex-col gap-1 text-xs sm:text-sm">
                 <p>Sessions: {weekly.sessions}</p>
                 <p>Steps done: {weekly.stepsCompleted}</p>
                 <p>Focus minutes: {weekly.focusMinutes}</p>
-              </>
+              </div>
             )}
           </SidebarGroupContent>
         </SidebarGroup>
         <SidebarSeparator />
-        <SidebarGroup className="px-1">
-          <SidebarGroupLabel>Streaks</SidebarGroupLabel>
-          <SidebarGroupContent className="space-y-1 px-4 text-sm">
-            <p>Current: {streak.current} days</p>
-            <p>Longest: {streak.longest} days</p>
-            <p>Last active: {streak.lastActiveDayKey ?? "none"}</p>
+        <SidebarGroup className="px-0 sm:px-1">
+          <SidebarGroupLabel className="px-2">Streaks</SidebarGroupLabel>
+          <SidebarGroupContent className="grid grid-cols-2 gap-x-2 gap-y-0.5 px-2 text-[11px] sm:px-3 sm:text-xs">
+            <p className="text-muted-foreground">Current</p>
+            <p className="text-right tabular-nums">{streak.current}d</p>
+            <p className="text-muted-foreground">Longest</p>
+            <p className="text-right tabular-nums">{streak.longest}d</p>
+            <p className="col-span-2 truncate text-[10px] text-muted-foreground sm:text-[11px]">
+              Last: {streak.lastActiveDayKey ?? "—"}
+            </p>
           </SidebarGroupContent>
         </SidebarGroup>
         {mode === "copilot" ? (
@@ -330,19 +350,39 @@ function AppSidebarRight({
           <SidebarSeparator />
         )}
         <SidebarGroup className="px-1">
-          <SidebarGroupLabel>
-            {mode === "pushups"
-              ? `Selected Day Workouts (${selectedPushupSessions.length})`
-              : `Selected Day History (${selectedDayHistory.length})`}
+          <SidebarGroupLabel className="px-2">
+            {mode === "pushups" ? (
+              <span className="flex flex-col gap-0.5 normal-case">
+                <span>Workouts</span>
+                <span className="text-[11px] font-normal text-muted-foreground">
+                  {formatSelectedDay(selectedDate)}
+                  {selectedPushupSessions.length > 0
+                    ? ` · ${selectedPushupSessions.length} session${
+                        selectedPushupSessions.length === 1 ? "" : "s"
+                      }`
+                    : ""}
+                </span>
+              </span>
+            ) : (
+              `Selected Day History (${selectedDayHistory.length})`
+            )}
           </SidebarGroupLabel>
           <SidebarGroupContent className="px-2">
-            <SidebarMenu>
+            <SidebarMenu
+              className={
+                mode === "pushups"
+                  ? "max-h-[min(12rem,36vh)] gap-0.5 overflow-y-auto overscroll-contain"
+                  : undefined
+              }
+            >
               {(mode === "pushups"
                 ? selectedPushupSessions.length === 0
                 : selectedDayHistory.length === 0) ? (
                 <SidebarMenuItem>
                   <SidebarMenuButton disabled>
-                    No entries on selected day
+                    {mode === "pushups"
+                      ? "No reps logged this day"
+                      : "No entries on selected day"}
                   </SidebarMenuButton>
                 </SidebarMenuItem>
               ) : (
@@ -351,15 +391,24 @@ function AppSidebarRight({
                     <SidebarMenuItem key={entry._id}>
                       <SidebarMenuButton
                         onClick={() => router.push("/pushups")}
-                        className="h-auto min-h-12 px-3 py-2"
+                        className="h-auto min-h-0 px-2.5 py-1.5 text-left"
                       >
                         <div className="flex w-full flex-col gap-0.5">
-                          <span className="truncate">
-                            {entry.roomId} · {entry.maxReps} reps
+                          <span className="text-xs leading-snug">
+                            <span className="font-medium tabular-nums text-foreground">
+                              {entry.maxReps}
+                            </span>{" "}
+                            reps
+                            <span className="text-muted-foreground">
+                              {" "}
+                              · {entry.roomId}
+                            </span>
                           </span>
-                          <span className="text-xs text-muted-foreground">
-                            {formatShortTime(entry.endedAt ?? entry.startedAt)} ·{" "}
-                            {entry.caloriesEstimate} cal
+                          <span className="text-[11px] text-muted-foreground">
+                            {formatShortTime(entry.endedAt ?? entry.startedAt)}
+                            {entry.caloriesEstimate > 0 ? (
+                              <> · {entry.caloriesEstimate} kcal</>
+                            ) : null}
                           </span>
                         </div>
                       </SidebarMenuButton>
@@ -387,7 +436,46 @@ function AppSidebarRight({
           </SidebarGroupContent>
         </SidebarGroup>
       </SidebarContent>
-    </Sidebar>
+    </>
+  );
+}
+
+function AppSidebarRight(
+  props: React.ComponentProps<typeof InsightsSidebarBody> & {
+    mobileOpen: boolean;
+    onMobileOpenChange: (open: boolean) => void;
+  },
+) {
+  const { mobileOpen, onMobileOpenChange, ...insightsProps } = props;
+
+  return (
+    <>
+      <Sidebar
+        side="right"
+        collapsible="none"
+        className="hidden h-svh w-[min(17rem,calc(100vw-1rem))] max-w-[min(17rem,92vw)] min-w-0 shrink-0 overflow-x-hidden border-l lg:flex"
+      >
+        <InsightsSidebarBody {...insightsProps} />
+      </Sidebar>
+
+      <Sheet open={mobileOpen} onOpenChange={onMobileOpenChange}>
+        <SheetContent
+          side="right"
+          showCloseButton
+          className="flex h-[100dvh] max-h-[100dvh] w-full max-w-[min(100vw,17rem)] flex-col gap-0 overflow-y-auto border-l border-sidebar-border bg-sidebar p-0 text-sidebar-foreground sm:max-h-none sm:max-w-[17rem]"
+        >
+          <SheetHeader className="sr-only">
+            <SheetTitle>Insights and calendar</SheetTitle>
+            <SheetDescription>
+              Weekly stats, calendar, and day history.
+            </SheetDescription>
+          </SheetHeader>
+          <div className="flex min-h-0 flex-1 flex-col">
+            <InsightsSidebarBody {...insightsProps} />
+          </div>
+        </SheetContent>
+      </Sheet>
+    </>
   );
 }
 
@@ -402,6 +490,7 @@ export function CopilotAppShell({
   const { user, isLoaded: isUserLoaded } = useUser();
   const pathname = usePathname();
   const isPushupsMode = pathname.startsWith("/pushups");
+  const [insightsSheetOpen, setInsightsSheetOpen] = useState(false);
   const [selectedDate, setSelectedDate] = useState<Date | undefined>(new Date());
   const [pushupInsights, setPushupInsights] = useState<{
     selectedDaySessions: PushupSessionItem[];
@@ -481,13 +570,24 @@ export function CopilotAppShell({
     [selectedDayHistory],
   );
 
-  const selectedPushupSessions = pushupInsights?.selectedDaySessions ?? [];
-  const selectedPushupSummary = pushupInsights?.selectedDayStats ?? {
-    workouts: 0,
-    totalReps: 0,
-    calories: 0,
-    minutes: 0,
-  };
+  const selectedPushupSessions = useMemo(() => {
+    return finalizeSelectedDaySessions(
+      pushupInsights?.selectedDaySessions ?? [],
+    );
+  }, [pushupInsights?.selectedDaySessions]);
+
+  const selectedPushupSummary = useMemo((): PushupStats => {
+    if (!isPushupsMode) {
+      return {
+        workouts: 0,
+        totalReps: 0,
+        calories: 0,
+        minutes: 0,
+      };
+    }
+    return reducePushupDayStats(selectedPushupSessions);
+  }, [isPushupsMode, selectedPushupSessions]);
+
   const weeklyPushups = pushupInsights?.weeklyStats ?? {
     workouts: 0,
     totalReps: 0,
@@ -522,7 +622,7 @@ export function CopilotAppShell({
     "";
 
   return (
-    <SidebarProvider className="min-h-svh bg-muted/25">
+    <SidebarProvider className="min-h-svh max-w-[100vw] overflow-x-hidden bg-muted/25">
       <AppSidebarLeft
         pathname={pathname}
         history={history}
@@ -531,16 +631,29 @@ export function CopilotAppShell({
         isUserLoaded={isUserLoaded}
       />
       <SidebarInset>
-        <header className="sticky top-0 z-10 flex h-14 shrink-0 items-center gap-2 border-b bg-background">
-          <div className="flex flex-1 items-center gap-2 px-3">
+        <header className="sticky top-0 z-10 flex h-14 shrink-0 items-center gap-2 border-b bg-background px-2 sm:px-3">
+          <div className="flex min-w-0 flex-1 items-center gap-2">
             <SidebarTrigger />
             <h1 className="line-clamp-1 text-sm font-medium">{title}</h1>
           </div>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="shrink-0 lg:hidden"
+            onClick={() => setInsightsSheetOpen(true)}
+          >
+            Insights
+          </Button>
         </header>
-        <div className="flex min-h-0 flex-1 flex-col">{children}</div>
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-x-hidden">
+          {children}
+        </div>
       </SidebarInset>
       <AppSidebarRight
         mode={isPushupsMode ? "pushups" : "copilot"}
+        mobileOpen={insightsSheetOpen}
+        onMobileOpenChange={setInsightsSheetOpen}
         selectedDate={selectedDate}
         onSelectedDateChange={setSelectedDate}
         selectedDayHistory={selectedDayHistory}
