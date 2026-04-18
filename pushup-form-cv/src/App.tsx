@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import {
   DrawingUtils,
   FilesetResolver,
+  HandLandmarker,
   PoseLandmarker,
 } from '@mediapipe/tasks-vision'
 import './App.css'
@@ -17,8 +18,13 @@ type Stage = 'up' | 'down'
 
 const MODEL_URL =
   'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task'
+const HAND_MODEL_LOCAL_URL = '/assets/hand_landmarker.task'
+const HAND_MODEL_FALLBACK_URL =
+  'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task'
 const WASM_URL =
   'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.34/wasm'
+
+
 
 function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value))
@@ -58,6 +64,8 @@ function App() {
   const [statusText, setStatusText] = useState('Loading pose model...')
   const [qualityScore, setQualityScore] = useState(0)
   const [repCount, setRepCount] = useState(0)
+  const [handsDetected, setHandsDetected] = useState(0)
+  const [elapsedSeconds, setElapsedSeconds] = useState(0)
   const [feedback, setFeedback] = useState<string[]>([
     'Press Start Camera and begin pushups in profile view.',
   ])
@@ -66,8 +74,43 @@ function App() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const streamRef = useRef<MediaStream | null>(null)
   const poseLandmarkerRef = useRef<PoseLandmarker | null>(null)
+  const handLandmarkerRef = useRef<HandLandmarker | null>(null)
   const rafRef = useRef<number | null>(null)
+  const lastVideoTimeRef = useRef(-1)
+  const handsDetectedRef = useRef(0)
+  const timerRef = useRef<number | null>(null)
+  const startTimestampRef = useRef<number | null>(null)
   const stageRef = useRef<Stage>('up')
+
+  function formatDuration(totalSeconds: number) {
+    const minutes = Math.floor(totalSeconds / 60)
+    const seconds = totalSeconds % 60
+    return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
+  }
+
+  function stopTimer() {
+    if (timerRef.current !== null) {
+      window.clearInterval(timerRef.current)
+      timerRef.current = null
+    }
+    startTimestampRef.current = null
+  }
+
+  function startTimer() {
+    stopTimer()
+    const start = Date.now()
+    startTimestampRef.current = start
+    setElapsedSeconds(0)
+
+    timerRef.current = window.setInterval(() => {
+      const currentStart = startTimestampRef.current
+      if (!currentStart) {
+        return
+      }
+      const seconds = Math.floor((Date.now() - currentStart) / 1000)
+      setElapsedSeconds(seconds)
+    }, 1000)
+  }
 
   function stopCamera() {
     if (rafRef.current !== null) {
@@ -92,7 +135,10 @@ function App() {
       ctx.clearRect(0, 0, canvas.width, canvas.height)
     }
 
+    stopTimer()
     setIsCameraOn(false)
+    setHandsDetected(0)
+    handsDetectedRef.current = 0
     setStatusText('Camera is off')
     setFeedback(['Press Start Camera and begin pushups in profile view.'])
   }
@@ -109,19 +155,52 @@ function App() {
         },
         runningMode: 'VIDEO',
         numPoses: 1,
+        minPoseDetectionConfidence: 0.6,
+        minPosePresenceConfidence: 0.6,
+        minTrackingConfidence: 0.6,
+        outputSegmentationMasks: false,
       })
+
+      let handLandmarker: HandLandmarker
+      try {
+        handLandmarker = await HandLandmarker.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath: HAND_MODEL_LOCAL_URL,
+            delegate: 'GPU',
+          },
+          runningMode: 'VIDEO',
+          numHands: 2,
+          minHandDetectionConfidence: 0.6,
+          minHandPresenceConfidence: 0.6,
+          minTrackingConfidence: 0.6,
+        })
+      } catch {
+        handLandmarker = await HandLandmarker.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath: HAND_MODEL_FALLBACK_URL,
+            delegate: 'GPU',
+          },
+          runningMode: 'VIDEO',
+          numHands: 2,
+          minHandDetectionConfidence: 0.6,
+          minHandPresenceConfidence: 0.6,
+          minTrackingConfidence: 0.6,
+        })
+      }
 
       if (cancelled) {
         poseLandmarker.close()
+        handLandmarker.close()
         return
       }
 
       poseLandmarkerRef.current = poseLandmarker
-      setStatusText('Model loaded. Ready to start camera.')
+      handLandmarkerRef.current = handLandmarker
+      setStatusText('Pose and hand models loaded. Ready to start camera.')
     }
 
     initLandmarker().catch(() => {
-      setStatusText('Failed to load pose model.')
+      setStatusText('Failed to load MediaPipe models.')
       setFeedback(['Refresh and try again. Network access is required once.'])
     })
 
@@ -129,7 +208,9 @@ function App() {
       cancelled = true
       stopCamera()
       poseLandmarkerRef.current?.close()
+      handLandmarkerRef.current?.close()
       poseLandmarkerRef.current = null
+      handLandmarkerRef.current = null
     }
   }, [])
 
@@ -239,8 +320,9 @@ function App() {
     const video = videoRef.current
     const canvas = canvasRef.current
     const poseLandmarker = poseLandmarkerRef.current
+    const handLandmarker = handLandmarkerRef.current
 
-    if (!video || !canvas || !poseLandmarker || !isCameraOn) {
+    if (!video || !canvas || !poseLandmarker || !handLandmarker || !isCameraOn) {
       return
     }
 
@@ -253,8 +335,18 @@ function App() {
     canvas.width = video.videoWidth
     canvas.height = video.videoHeight
 
+    if (video.currentTime === lastVideoTimeRef.current) {
+      rafRef.current = requestAnimationFrame(renderLoop)
+      return
+    }
+
+    lastVideoTimeRef.current = video.currentTime
+
     const result = poseLandmarker.detectForVideo(video, performance.now()) as {
       landmarks?: Landmark[][]
+    }
+    const handResult = handLandmarker.detectForVideo(video, performance.now()) as {
+      landmarks?: Array<Array<{ x: number; y: number; z: number }>>
     }
 
     ctx.clearRect(0, 0, canvas.width, canvas.height)
@@ -264,26 +356,70 @@ function App() {
       const drawingUtils = new DrawingUtils(ctx)
 
       drawingUtils.drawConnectors(landmarks, PoseLandmarker.POSE_CONNECTIONS, {
-        color: '#24d17e',
-        lineWidth: 4,
+        color: '#21ff9b',
+        lineWidth: 6,
       })
       drawingUtils.drawLandmarks(landmarks, {
-        color: '#ffef8c',
+        color: '#ffe86f',
         lineWidth: 2,
-        radius: 3,
+        radius: 4,
       })
 
+
+
+      const leftWrist = landmarks[15]
+      const rightWrist = landmarks[16]
+      if (leftWrist && rightWrist) {
+        const wristDistance = Math.hypot(leftWrist.x - rightWrist.x, leftWrist.y - rightWrist.y)
+        if (wristDistance < 0.06) {
+          setFeedback(['Spread hands slightly wider for better shoulder alignment.'])
+        }
+      }
+
       analyzePose(landmarks)
+
+      setStatusText((previous) =>
+        previous.includes('Form quality') ? previous : 'Limb overlay tracking active',
+      )
     } else {
       setStatusText('No person detected')
       setFeedback(['Move fully into frame and face sideways for best results.'])
+    }
+
+    const handLandmarks = handResult.landmarks ?? []
+    if (handLandmarks.length > 0) {
+      const drawingUtils = new DrawingUtils(ctx)
+      for (const landmarks of handLandmarks) {
+        const normalizedLandmarks = landmarks.map((landmark) => ({
+          x: landmark.x,
+          y: landmark.y,
+          z: landmark.z,
+          visibility: 1,
+        }))
+
+        drawingUtils.drawConnectors(normalizedLandmarks, HandLandmarker.HAND_CONNECTIONS, {
+          color: '#1ec8ff',
+          lineWidth: 4,
+        })
+        drawingUtils.drawLandmarks(normalizedLandmarks, {
+          color: '#fff7a8',
+          fillColor: '#f575ff',
+          lineWidth: 2,
+          radius: 3,
+        })
+      }
+    }
+
+    if (handsDetectedRef.current !== handLandmarks.length) {
+      handsDetectedRef.current = handLandmarks.length
+      setHandsDetected(handLandmarks.length)
     }
 
     rafRef.current = requestAnimationFrame(renderLoop)
   }
 
   async function startCamera() {
-    if (!poseLandmarkerRef.current) {
+    if (!poseLandmarkerRef.current || !handLandmarkerRef.current) {
       setStatusText('Model still loading...')
       return
     }
@@ -309,8 +445,12 @@ function App() {
       await video.play()
 
       stageRef.current = 'up'
+      lastVideoTimeRef.current = -1
+      setHandsDetected(0)
+      handsDetectedRef.current = 0
       setRepCount(0)
       setQualityScore(0)
+      startTimer()
       setStatusText('Camera active')
       setFeedback(['Begin your first rep.'])
       setIsCameraOn(true)
@@ -334,7 +474,7 @@ function App() {
       <section className="control-panel">
         <h1>Pushup Form Coach</h1>
         <p className="subtitle">
-          Live CV feedback powered by MediaPipe Pose Landmarker.
+          Live CV feedback powered by MediaPipe Pose + Hand Landmarker.
         </p>
 
         <div className="metrics">
@@ -345,6 +485,14 @@ function App() {
           <div className="metric">
             <span className="label">Reps</span>
             <strong>{repCount}</strong>
+          </div>
+          <div className="metric">
+            <span className="label">Timer</span>
+            <strong>{formatDuration(elapsedSeconds)}</strong>
+          </div>
+          <div className="metric">
+            <span className="label">Hands</span>
+            <strong>{handsDetected}</strong>
           </div>
         </div>
 

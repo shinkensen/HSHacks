@@ -23,12 +23,15 @@
   position: relative;
   border-radius: 14px;
   overflow: hidden;
+  aspect-ratio: 16 / 9;
   min-height: 420px;
   background: #071423;
 }
 
 .camera,
 .overlay {
+  position: absolute;
+  inset: 0;
   width: 100%;
   height: 100%;
   display: block;
@@ -37,11 +40,11 @@
 
 .camera {
   object-fit: cover;
+  z-index: 1;
 }
 
 .overlay {
-  position: absolute;
-  inset: 0;
+  z-index: 2;
   pointer-events: none;
 }
 
@@ -65,7 +68,7 @@ h1 {
 
 .metrics {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 0.75rem;
 }
 
@@ -162,6 +165,14 @@ button.secondary {
   }
 
   .video-stack {
-    min-height: 300px;
+    min-height: 280px;
+  }
+
+  .metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .metric:last-child {
+    grid-column: 1 / -1;
   }
 }

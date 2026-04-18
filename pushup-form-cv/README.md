@@ -40,5 +40,8 @@ npm run preview
 ## Notes
 
 - The first load downloads MediaPipe assets from CDN.
+- The app now uses `hand_landmarker.task` with this lookup order:
+  1. Local: `/models/hand_landmarker.task`
+  2. Fallback CDN model URL if local file is missing
 - For best detection quality, keep your entire body visible and use good lighting.
 - This is coaching feedback, not medical advice.
