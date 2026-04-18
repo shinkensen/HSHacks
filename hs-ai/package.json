@@ -15,6 +15,7 @@
     "@hugeicons/react": "^1.1.6",
     "@mediapipe/tasks-vision": "^0.10.34",
     "@shivantra/react-web-camera": "^1.1.0",
+    "agora-rtc-sdk-ng": "^4.24.3",
     "ai": "^6.0.168",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
