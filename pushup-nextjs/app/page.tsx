@@ -138,8 +138,7 @@ export default function Home() {
   const [handsDetected, setHandsDetected] = useState(0)
   const [elapsedSeconds, setElapsedSeconds] = useState(0)
   const [feedback, setFeedback] = useState<string[]>(['Press Start Camera and begin pushups in profile view.'])
-  const [relayOrigin, setRelayOrigin] = useState('')
-  const [roomId, setRoomId] = useState('')
+  const [roomId, setRoomId] = useState('pushups')
   const [shareEnabled, setShareEnabled] = useState(false)
   const [remoteFeeds, setRemoteFeeds] = useState<RemoteDeviceFeed[]>([])
 
@@ -175,11 +174,8 @@ export default function Home() {
   }
 
   useEffect(() => {
-    if (typeof window !== 'undefined') {
-      setRelayOrigin(window.location.origin)
-      if (deviceIdRef.current === 'dev-pending') {
-        deviceIdRef.current = `dev-${randomId()}`
-      }
+    if (deviceIdRef.current === 'dev-pending') {
+      deviceIdRef.current = `dev-${randomId()}`
     }
   }, [])
 
@@ -188,7 +184,7 @@ export default function Home() {
   }, [remoteFeeds])
 
   useEffect(() => {
-    if (!shareEnabled || !roomId.trim() || !relayOrigin.trim()) {
+    if (!shareEnabled || !roomId.trim()) {
       setRemoteFeeds([])
       return
     }
@@ -198,7 +194,7 @@ export default function Home() {
     async function pullRoomFeeds() {
       try {
         const response = await fetch(
-          `${relayOrigin}/api/rooms/${encodeURIComponent(roomId.trim())}/landmarks`,
+          `/api/rooms/${encodeURIComponent(roomId.trim())}/landmarks`,
           { cache: 'no-store' },
         )
         if (!response.ok || stopped) {
@@ -209,7 +205,7 @@ export default function Home() {
         setRemoteFeeds(devices)
       } catch {
         if (!stopped) {
-          setStatusText('Room relay unreachable. Check local network URL.')
+          setStatusText('Room relay unreachable. Verify server/network connection.')
         }
       }
     }
@@ -221,7 +217,7 @@ export default function Home() {
       stopped = true
       window.clearInterval(interval)
     }
-  }, [shareEnabled, roomId, relayOrigin])
+  }, [shareEnabled, roomId])
 
   function stopTimer() {
     if (timerRef.current !== null) {
@@ -589,7 +585,7 @@ export default function Home() {
       })
       analyzePose(poses)
 
-      if (shareEnabled && roomId.trim() && relayOrigin.trim()) {
+      if (shareEnabled && roomId.trim()) {
         if (t - lastSharePushAtRef.current >= SHARE_PUSH_INTERVAL_MS) {
           lastSharePushAtRef.current = t
           const payload = {
@@ -611,7 +607,7 @@ export default function Home() {
             ),
           }
 
-          void fetch(`${relayOrigin}/api/rooms/${encodeURIComponent(roomId.trim())}/landmarks`, {
+          void fetch(`/api/rooms/${encodeURIComponent(roomId.trim())}/landmarks`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload),
@@ -732,30 +728,19 @@ export default function Home() {
         </div>
 
         <div className="bg-neutral-800 p-4 rounded-lg space-y-3">
-          <h2 className="font-semibold">Local Network Room Relay</h2>
+          <h2 className="font-semibold">Cloud Room Relay</h2>
           <p className="text-sm text-neutral-300">
-            Use the same room ID and relay URL on all devices in your LAN.
+            Use the same room ID on all devices. Relay is handled by this server (Redis enabled).
           </p>
-          <div className="grid md:grid-cols-2 gap-3">
-            <label className="text-sm space-y-1 block">
-              <span className="text-neutral-300">Relay URL</span>
-              <input
-                value={relayOrigin}
-                onChange={(e) => setRelayOrigin(e.target.value)}
-                className="w-full rounded bg-neutral-900 border border-neutral-700 px-3 py-2"
-                placeholder="http://192.168.x.x:3000"
-              />
-            </label>
-            <label className="text-sm space-y-1 block">
-              <span className="text-neutral-300">Room ID</span>
-              <input
-                value={roomId}
-                onChange={(e) => setRoomId(e.target.value)}
-                className="w-full rounded bg-neutral-900 border border-neutral-700 px-3 py-2"
-                placeholder="pushup-lab"
-              />
-            </label>
-          </div>
+          <label className="text-sm space-y-1 block">
+            <span className="text-neutral-300">Room name</span>
+            <input
+              value={roomId}
+              onChange={(e) => setRoomId(e.target.value)}
+              className="w-full rounded bg-neutral-900 border border-neutral-700 px-3 py-2"
+              placeholder="pushup-lab"
+            />
+          </label>
           <label className="inline-flex items-center gap-2 text-sm">
             <input
               type="checkbox"
