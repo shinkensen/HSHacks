@@ -46,6 +46,17 @@ type SideMetrics = {
   valid: boolean;
 };
 
+type MotionSample = {
+  ts: number;
+  formScore: number;
+  elbowAngle: number;
+  bodyDeviation: number;
+  hipDeviation: number;
+  elbowAsymmetry: number;
+  normalizedDepth: number;
+  normalizedShoulderDepth: number;
+};
+
 type RemoteMediaFeed = {
   deviceId: string;
   stream: MediaStream;
@@ -80,7 +91,15 @@ const ELBOW_ALPHA = 0.42;
 const BODY_ALPHA = 0.22;
 const REP_COOLDOWN_MS = 280;
 const REP_COOLDOWN_MS_FRONTAL = 340;
+const REP_COOLDOWN_MS_FAST = 180;
+const REP_COOLDOWN_MS_FRONTAL_FAST = 220;
 const MAX_FRONTAL_ELBOW_ASYMMETRY = 28;
+const FAST_REP_MIN_DOWN_HOLD_MS = 45;
+const FAST_REP_MIN_DOWN_HOLD_MS_FRONTAL = 60;
+const FAST_REP_DEPTH_MULTIPLIER = 1.2;
+const FAST_REP_ELBOW_BONUS = 10;
+const MOTION_SAMPLE_INTERVAL_MS = 400;
+const MAX_MOTION_SAMPLES = 360;
 const SHARE_PUSH_INTERVAL_MS = 100;
 const SHARE_PULL_INTERVAL_MS = 180;
 const SIGNAL_PULL_INTERVAL_MS = 300;
@@ -332,6 +351,12 @@ export function PushupCoach() {
   const [formHistory, setFormHistory] = useState<
     Array<{ ts: number; score: number }>
   >([]);
+  const [motionSamples, setMotionSamples] = useState<MotionSample[]>([]);
+  const [summaryPending, setSummaryPending] = useState(false);
+  const [workoutSummary, setWorkoutSummary] = useState<string | null>(null);
+  const [summaryCapturedAt, setSummaryCapturedAt] = useState<number | null>(
+    null,
+  );
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -368,6 +393,7 @@ export function PushupCoach() {
   const shareAlertTimerRef = useRef<number | null>(null);
   const lastFormPointAtRef = useRef(0);
   const lastRepRecordedAtRef = useRef<number | null>(null);
+  const lastMotionSampleAtRef = useRef(0);
 
   function formatDuration(totalSeconds: number) {
     const minutes = Math.floor(totalSeconds / 60);
@@ -535,17 +561,98 @@ export function PushupCoach() {
     return durations.slice(-12);
   }, [repTimestamps]);
 
-  const formPoints = useMemo(() => {
-    if (formHistory.length === 0) return "";
-    const max = formHistory.length - 1 || 1;
-    return formHistory
-      .map((point, index) => {
-        const x = (index / max) * 100;
-        const y = 100 - point.score;
+  const chartSamples = useMemo(() => motionSamples.slice(-120), [motionSamples]);
+
+  const elbowSeries = useMemo(
+    () => chartSamples.map((sample) => sample.elbowAngle),
+    [chartSamples],
+  );
+
+  const bodyDeviationSeries = useMemo(
+    () => chartSamples.map((sample) => sample.bodyDeviation),
+    [chartSamples],
+  );
+
+  const depthSeries = useMemo(
+    () =>
+      chartSamples.map((sample) =>
+        Number(
+          (
+            Math.max(sample.normalizedDepth, sample.normalizedShoulderDepth) * 100
+          ).toFixed(2),
+        ),
+      ),
+    [chartSamples],
+  );
+
+  const avgFormScore = useMemo(() => {
+    if (formHistory.length === 0) return qualityScore;
+    const total = formHistory.reduce((sum, point) => sum + point.score, 0);
+    return Math.round(total / formHistory.length);
+  }, [formHistory, qualityScore]);
+
+  const avgRepDuration = useMemo(() => {
+    if (repDurations.length === 0) return 0;
+    const total = repDurations.reduce((sum, value) => sum + value, 0);
+    return Number((total / repDurations.length).toFixed(2));
+  }, [repDurations]);
+
+  const repPaceMax = useMemo(
+    () => Math.max(4, ...repDurations.map((value) => Number(value.toFixed(2)))),
+    [repDurations],
+  );
+
+  function buildFallbackSummary() {
+    const fastest = repDurations.length > 0 ? Math.min(...repDurations) : 0;
+    const slowest = repDurations.length > 0 ? Math.max(...repDurations) : 0;
+    return [
+      `Completed ${repCount} reps in ${formatDuration(elapsedSeconds)} with estimated ${calorieEstimate} kcal burned.`,
+      `Average form score was ${avgFormScore}/100 with ${handsDetected} hands detected at end of session.`,
+      repDurations.length > 0
+        ? `Rep pace ranged from ${fastest.toFixed(1)}s to ${slowest.toFixed(1)}s (avg ${avgRepDuration.toFixed(1)}s).`
+        : "Complete at least 2 reps to unlock pace analytics.",
+      `Target progress reached ${goalProgress}% (${repCount}/${targetReps}).`,
+    ].join(" ");
+  }
+
+  function buildLinePath(values: number[], min: number, max: number): string {
+    if (values.length === 0) return "";
+    const range = Math.max(0.0001, max - min);
+    const lastIndex = Math.max(1, values.length - 1);
+    return values
+      .map((value, index) => {
+        const x = 10 + (index / lastIndex) * 86;
+        const normalized = clamp((value - min) / range, 0, 1);
+        const y = 92 - normalized * 78;
         return `${x},${y}`;
       })
       .join(" ");
-  }, [formHistory]);
+  }
+
+  const formSeries = useMemo(
+    () => chartSamples.map((sample) => sample.formScore),
+    [chartSamples],
+  );
+
+  const formPoints = useMemo(
+    () => buildLinePath(formSeries, 0, 100),
+    [formSeries],
+  );
+
+  const elbowPoints = useMemo(
+    () => buildLinePath(elbowSeries, 70, 180),
+    [elbowSeries],
+  );
+
+  const bodyDeviationPoints = useMemo(
+    () => buildLinePath(bodyDeviationSeries, 0, 60),
+    [bodyDeviationSeries],
+  );
+
+  const depthPoints = useMemo(
+    () => buildLinePath(depthSeries, 0, 20),
+    [depthSeries],
+  );
 
   useEffect(() => {
     remoteFeedsRef.current = remoteFeeds;
@@ -1357,6 +1464,17 @@ export function PushupCoach() {
       isVisible(leftShoulder) && isVisible(rightShoulder)
         ? (leftShoulder!.y + rightShoulder!.y) / 2
         : hipY;
+    const liveNormalizedDepth =
+      shoulderWidth > 0
+        ? ((bottomHipYRef.current ?? hipY) - (topHipYRef.current ?? hipY)) /
+          shoulderWidth
+        : 0;
+    const liveNormalizedShoulderDepth =
+      shoulderWidth > 0
+        ? ((bottomShoulderYRef.current ?? shoulderY) -
+            (topShoulderYRef.current ?? shoulderY)) /
+          shoulderWidth
+        : 0;
 
     if (stageRef.current === "up") {
       if (topHipYRef.current === null || hipY < topHipYRef.current) {
@@ -1441,16 +1559,38 @@ export function PushupCoach() {
       const downDurationMs = downStartedAtRef.current
         ? now - downStartedAtRef.current
         : 0;
-      const cooldownPassed =
-        now - lastRepAtRef.current >=
-        (frontalMode ? REP_COOLDOWN_MS_FRONTAL : REP_COOLDOWN_MS);
       const depthOk = frontalMode
         ? normalizedShoulderDepth >= MIN_SHOULDER_HEIGHT_DELTA
         : normalizedDepth >= MIN_HIP_HEIGHT_DELTA;
       const excursionOk = elbowExcursion >=
         (frontalMode ? MIN_ELBOW_EXCURSION_FRONTAL : MIN_ELBOW_EXCURSION);
-      const downHeldEnough = downDurationMs >= (frontalMode ? 110 : 80);
       const symmetryOk = !frontalMode || elbowAsymmetry <= MAX_FRONTAL_ELBOW_ASYMMETRY;
+      const fastDepthOk = frontalMode
+        ? normalizedShoulderDepth >=
+          MIN_SHOULDER_HEIGHT_DELTA * FAST_REP_DEPTH_MULTIPLIER
+        : normalizedDepth >= MIN_HIP_HEIGHT_DELTA * FAST_REP_DEPTH_MULTIPLIER;
+      const fastExcursionOk =
+        elbowExcursion >=
+        (frontalMode ? MIN_ELBOW_EXCURSION_FRONTAL : MIN_ELBOW_EXCURSION) +
+          FAST_REP_ELBOW_BONUS;
+      const fastRepCandidate =
+        downDurationMs >=
+          (frontalMode
+            ? FAST_REP_MIN_DOWN_HOLD_MS_FRONTAL
+            : FAST_REP_MIN_DOWN_HOLD_MS) &&
+        fastDepthOk &&
+        fastExcursionOk &&
+        symmetryOk;
+      const cooldownTargetMs = fastRepCandidate
+        ? frontalMode
+          ? REP_COOLDOWN_MS_FRONTAL_FAST
+          : REP_COOLDOWN_MS_FAST
+        : frontalMode
+          ? REP_COOLDOWN_MS_FRONTAL
+          : REP_COOLDOWN_MS;
+      const cooldownPassed = now - lastRepAtRef.current >= cooldownTargetMs;
+      const downHeldEnough =
+        downDurationMs >= (frontalMode ? 110 : 80) || fastRepCandidate;
 
       if (
         cooldownPassed &&
@@ -1525,6 +1665,26 @@ export function PushupCoach() {
       lastFormPointAtRef.current = performance.now();
       setFormHistory((prev) =>
         [...prev, { ts: Date.now(), score: finalScore }].slice(-120),
+      );
+    }
+    if (performance.now() - lastMotionSampleAtRef.current >= MOTION_SAMPLE_INTERVAL_MS) {
+      lastMotionSampleAtRef.current = performance.now();
+      setMotionSamples((prev) =>
+        [
+          ...prev,
+          {
+            ts: Date.now(),
+            formScore: finalScore,
+            elbowAngle: Number(smoothedElbow.toFixed(2)),
+            bodyDeviation: Number(bodyDeviation.toFixed(2)),
+            hipDeviation: Number(hipDeviation.toFixed(2)),
+            elbowAsymmetry: Number(elbowAsymmetry.toFixed(2)),
+            normalizedDepth: Number(liveNormalizedDepth.toFixed(4)),
+            normalizedShoulderDepth: Number(
+              liveNormalizedShoulderDepth.toFixed(4),
+            ),
+          },
+        ].slice(-MAX_MOTION_SAMPLES),
       );
     }
 
@@ -1708,6 +1868,10 @@ export function PushupCoach() {
           setRepTimestamps([]);
           setQualityScore(0);
           setFormHistory([]);
+          setMotionSamples([]);
+          setWorkoutSummary(null);
+          setSummaryCapturedAt(null);
+          lastMotionSampleAtRef.current = 0;
           setFeedback([
             "Camera started. Side or head-on view works. Begin controlled reps.",
           ]);
@@ -1729,6 +1893,55 @@ export function PushupCoach() {
       }
     } catch {
       setStatusText("Camera access denied or failed");
+    }
+  }
+
+  async function endWorkout() {
+    if (summaryPending) return;
+
+    const capturedAt = Date.now();
+    if (isCameraOn) {
+      stopCamera();
+    }
+
+    setSummaryPending(true);
+    setSummaryCapturedAt(capturedAt);
+
+    const payload = {
+      roomId: normalizeRoomId(roomId),
+      username: normalizeUsername(username),
+      elapsedSeconds,
+      repCount,
+      targetReps,
+      goalProgress,
+      calorieEstimate,
+      qualityScore,
+      averageFormScore: avgFormScore,
+      averageRepDurationSeconds: avgRepDuration,
+      repDurations: repDurations.slice(-40),
+      telemetry: motionSamples.slice(-180),
+      feedback: feedback.slice(0, 5),
+      endedAt: capturedAt,
+    };
+
+    try {
+      const response = await fetch("/api/pushups/summary", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+
+      if (!response.ok) {
+        throw new Error("summary-request-failed");
+      }
+
+      const data = (await response.json()) as { summary?: string };
+      const summaryText = data.summary?.trim();
+      setWorkoutSummary(summaryText && summaryText.length > 0 ? summaryText : buildFallbackSummary());
+    } catch {
+      setWorkoutSummary(buildFallbackSummary());
+    } finally {
+      setSummaryPending(false);
     }
   }
 
@@ -1759,6 +1972,14 @@ export function PushupCoach() {
               disabled={!isCameraOn}
             >
               Stop camera
+            </Button>
+            <Button
+              className="min-h-9 flex-1 sm:flex-initial"
+              onClick={endWorkout}
+              variant="outline"
+              disabled={summaryPending || (!isCameraOn && repCount === 0)}
+            >
+              {summaryPending ? "Summarizing..." : "End workout"}
             </Button>
           </div>
         </header>
@@ -1977,22 +2198,24 @@ export function PushupCoach() {
             </div>
           </div>
           <div className="flex min-w-0 flex-col gap-3 sm:gap-5">
-            <div className="grid gap-3 sm:gap-4 lg:grid-cols-2">
+            <div className="grid gap-3 sm:gap-4 xl:grid-cols-2">
               <Card>
                 <CardHeader>
-                  <CardTitle className="text-base">Form history</CardTitle>
+                  <CardTitle className="text-base">Form score trend</CardTitle>
                 </CardHeader>
                 <CardContent className="flex flex-col gap-3">
-                  <div className="h-36 rounded-lg border bg-muted/25 p-2 flex flex-col justify-center">
+                  <div className="rounded-lg border bg-muted/25 p-2">
                     {formPoints ? (
-                      <svg viewBox="0 0 100 100" className="h-full w-full">
-                        <polyline
-                          points={formPoints}
-                          fill="none"
-                          stroke="currentColor"
-                          strokeWidth="2"
-                          className="text-primary"
-                        />
+                      <svg viewBox="0 0 100 100" className="h-40 w-full">
+                        <line x1="10" y1="92" x2="96" y2="92" stroke="currentColor" strokeOpacity="0.35" strokeWidth="0.7" />
+                        <line x1="10" y1="14" x2="10" y2="92" stroke="currentColor" strokeOpacity="0.35" strokeWidth="0.7" />
+                        <line x1="10" y1="53" x2="96" y2="53" stroke="currentColor" strokeOpacity="0.12" strokeWidth="0.6" />
+                        <polyline points={formPoints} fill="none" stroke="currentColor" strokeWidth="1.7" className="text-primary" />
+                        <text x="4" y="16" fontSize="4" className="fill-muted-foreground">100</text>
+                        <text x="4" y="55" fontSize="4" className="fill-muted-foreground">50</text>
+                        <text x="5" y="92" fontSize="4" className="fill-muted-foreground">0</text>
+                        <text x="44" y="99" fontSize="4" className="fill-muted-foreground">X: time samples</text>
+                        <text x="1.8" y="48" transform="rotate(-90 1.8 48)" fontSize="4" className="fill-muted-foreground">Y: form score</text>
                       </svg>
                     ) : (
                       <p className="text-sm text-muted-foreground">
@@ -2000,47 +2223,152 @@ export function PushupCoach() {
                       </p>
                     )}
                   </div>
-                  <p className="text-xs text-muted-foreground">
-                    Recent 120 samples, one point per second.
-                  </p>
                 </CardContent>
               </Card>
 
               <Card>
                 <CardHeader>
-                  <CardTitle className="text-base">Rep pace</CardTitle>
+                  <CardTitle className="text-base">Elbow angle trend</CardTitle>
                 </CardHeader>
                 <CardContent className="flex flex-col gap-3">
-                  {repDurations.length > 0 ? (
-                    <div className="flex h-36 items-end gap-1 rounded-lg border bg-muted/25 px-2 py-2">
-                      {repDurations.map((duration, index) => {
-                        const height = Math.max(
-                          12,
-                          Math.min(100, duration * 12),
-                        );
-                        return (
-                          <div
-                            key={`${duration}-${index}`}
-                            className="min-w-0 flex-1 rounded-sm bg-primary/85"
-                            style={{ height: `${height}%` }}
-                            title={`${duration.toFixed(1)}s`}
-                          />
-                        );
-                      })}
-                    </div>
-                  ) : (
-                    <div className="flex h-36 items-center rounded-lg border bg-muted/25 px-3">
+                  <div className="rounded-lg border bg-muted/25 p-2">
+                    {elbowPoints ? (
+                      <svg viewBox="0 0 100 100" className="h-40 w-full">
+                        <line x1="10" y1="92" x2="96" y2="92" stroke="currentColor" strokeOpacity="0.35" strokeWidth="0.7" />
+                        <line x1="10" y1="14" x2="10" y2="92" stroke="currentColor" strokeOpacity="0.35" strokeWidth="0.7" />
+                        <line x1="10" y1="53" x2="96" y2="53" stroke="currentColor" strokeOpacity="0.12" strokeWidth="0.6" />
+                        <polyline points={elbowPoints} fill="none" stroke="currentColor" strokeWidth="1.7" className="text-emerald-500" />
+                        <text x="2.5" y="16" fontSize="4" className="fill-muted-foreground">180</text>
+                        <text x="2.5" y="55" fontSize="4" className="fill-muted-foreground">125</text>
+                        <text x="2.5" y="92" fontSize="4" className="fill-muted-foreground">70</text>
+                        <text x="44" y="99" fontSize="4" className="fill-muted-foreground">X: time samples</text>
+                        <text x="1.8" y="48" transform="rotate(-90 1.8 48)" fontSize="4" className="fill-muted-foreground">Y: elbow angle</text>
+                      </svg>
+                    ) : (
+                      <p className="text-sm text-muted-foreground">
+                        Elbow angle graph appears while tracking.
+                      </p>
+                    )}
+                  </div>
+                </CardContent>
+              </Card>
+
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-base">Body deviation</CardTitle>
+                </CardHeader>
+                <CardContent className="flex flex-col gap-3">
+                  <div className="rounded-lg border bg-muted/25 p-2">
+                    {bodyDeviationPoints ? (
+                      <svg viewBox="0 0 100 100" className="h-40 w-full">
+                        <line x1="10" y1="92" x2="96" y2="92" stroke="currentColor" strokeOpacity="0.35" strokeWidth="0.7" />
+                        <line x1="10" y1="14" x2="10" y2="92" stroke="currentColor" strokeOpacity="0.35" strokeWidth="0.7" />
+                        <line x1="10" y1="53" x2="96" y2="53" stroke="currentColor" strokeOpacity="0.12" strokeWidth="0.6" />
+                        <polyline points={bodyDeviationPoints} fill="none" stroke="currentColor" strokeWidth="1.7" className="text-amber-500" />
+                        <text x="4" y="16" fontSize="4" className="fill-muted-foreground">60</text>
+                        <text x="4" y="55" fontSize="4" className="fill-muted-foreground">30</text>
+                        <text x="5" y="92" fontSize="4" className="fill-muted-foreground">0</text>
+                        <text x="44" y="99" fontSize="4" className="fill-muted-foreground">X: time samples</text>
+                        <text x="1.8" y="48" transform="rotate(-90 1.8 48)" fontSize="4" className="fill-muted-foreground">Y: degrees</text>
+                      </svg>
+                    ) : (
+                      <p className="text-sm text-muted-foreground">
+                        Body alignment graph appears while tracking.
+                      </p>
+                    )}
+                  </div>
+                </CardContent>
+              </Card>
+
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-base">Depth profile</CardTitle>
+                </CardHeader>
+                <CardContent className="flex flex-col gap-3">
+                  <div className="rounded-lg border bg-muted/25 p-2">
+                    {depthPoints ? (
+                      <svg viewBox="0 0 100 100" className="h-40 w-full">
+                        <line x1="10" y1="92" x2="96" y2="92" stroke="currentColor" strokeOpacity="0.35" strokeWidth="0.7" />
+                        <line x1="10" y1="14" x2="10" y2="92" stroke="currentColor" strokeOpacity="0.35" strokeWidth="0.7" />
+                        <line x1="10" y1="53" x2="96" y2="53" stroke="currentColor" strokeOpacity="0.12" strokeWidth="0.6" />
+                        <polyline points={depthPoints} fill="none" stroke="currentColor" strokeWidth="1.7" className="text-cyan-500" />
+                        <text x="4" y="16" fontSize="4" className="fill-muted-foreground">20</text>
+                        <text x="4" y="55" fontSize="4" className="fill-muted-foreground">10</text>
+                        <text x="5" y="92" fontSize="4" className="fill-muted-foreground">0</text>
+                        <text x="44" y="99" fontSize="4" className="fill-muted-foreground">X: time samples</text>
+                        <text x="1.8" y="48" transform="rotate(-90 1.8 48)" fontSize="4" className="fill-muted-foreground">Y: depth %</text>
+                      </svg>
+                    ) : (
+                      <p className="text-sm text-muted-foreground">
+                        Depth graph appears while tracking.
+                      </p>
+                    )}
+                  </div>
+                </CardContent>
+              </Card>
+
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-base">Rep pace (seconds)</CardTitle>
+                </CardHeader>
+                <CardContent className="flex flex-col gap-3">
+                  <div className="rounded-lg border bg-muted/25 p-2">
+                    {repDurations.length > 0 ? (
+                      <svg viewBox="0 0 100 100" className="h-40 w-full">
+                        <line x1="10" y1="92" x2="96" y2="92" stroke="currentColor" strokeOpacity="0.35" strokeWidth="0.7" />
+                        <line x1="10" y1="14" x2="10" y2="92" stroke="currentColor" strokeOpacity="0.35" strokeWidth="0.7" />
+                        <line x1="10" y1="53" x2="96" y2="53" stroke="currentColor" strokeOpacity="0.12" strokeWidth="0.6" />
+                        {repDurations.map((duration, index) => {
+                          const barWidth = 86 / Math.max(1, repDurations.length);
+                          const x = 10 + index * barWidth + 0.5;
+                          const height = clamp((duration / repPaceMax) * 78, 4, 78);
+                          const y = 92 - height;
+                          return (
+                            <rect
+                              key={`${duration}-${index}`}
+                              x={x}
+                              y={y}
+                              width={Math.max(1.8, barWidth - 1)}
+                              height={height}
+                              className="fill-primary/90"
+                            />
+                          );
+                        })}
+                        <text x="2" y="16" fontSize="4" className="fill-muted-foreground">{repPaceMax.toFixed(1)}</text>
+                        <text x="2" y="55" fontSize="4" className="fill-muted-foreground">{(repPaceMax / 2).toFixed(1)}</text>
+                        <text x="5" y="92" fontSize="4" className="fill-muted-foreground">0</text>
+                        <text x="44" y="99" fontSize="4" className="fill-muted-foreground">X: rep index</text>
+                        <text x="1.8" y="48" transform="rotate(-90 1.8 48)" fontSize="4" className="fill-muted-foreground">Y: seconds</text>
+                      </svg>
+                    ) : (
                       <p className="text-sm text-muted-foreground">
                         Rep duration graph appears after 2 reps.
                       </p>
-                    </div>
-                  )}
-                  <p className="text-xs text-muted-foreground">
-                    Bars show seconds spent per rep.
-                  </p>
+                    )}
+                  </div>
                 </CardContent>
               </Card>
             </div>
+
+            {(workoutSummary || summaryPending) ? (
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-base">AI workout summary</CardTitle>
+                </CardHeader>
+                <CardContent className="space-y-2">
+                  <p className="text-xs text-muted-foreground">
+                    {summaryCapturedAt
+                      ? `Captured at ${new Date(summaryCapturedAt).toLocaleString()}`
+                      : "Summary not captured yet."}
+                  </p>
+                  <p className="text-sm text-muted-foreground">
+                    {summaryPending
+                      ? "Generating summary with your configured AI gateway..."
+                      : workoutSummary}
+                  </p>
+                </CardContent>
+              </Card>
+            ) : null}
 
             {remoteMediaFeeds.length > 0 ? (
               <Card>
