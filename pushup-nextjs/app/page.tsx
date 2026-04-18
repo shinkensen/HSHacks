@@ -11,6 +11,14 @@ import {
 type Landmark = { x: number; y: number; z: number; visibility: number }
 type Stage = 'up' | 'down'
 
+type SideMetrics = {
+  elbowAngle: number
+  bodyAngle: number
+  wristShoulderDx: number
+  quality: number
+  valid: boolean
+}
+
 const MODEL_URL =
   'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task'
 const HAND_MODEL_LOCAL_URL = '/assets/hand_landmarker.task'
@@ -18,6 +26,14 @@ const HAND_MODEL_FALLBACK_URL =
   'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task'
 const WASM_URL =
   'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.34/wasm'
+
+const POSE_MIN_VIS = 0.55
+const MIN_REP_DOWN_ANGLE = 95
+const MIN_REP_UP_ANGLE = 158
+const MIN_REP_FRAMES = 3
+const MIN_HIP_HEIGHT_DELTA = 0.045
+const ELBOW_ALPHA = 0.3
+const BODY_ALPHA = 0.22
 
 function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value))
@@ -33,6 +49,19 @@ function angleABC(a: Landmark, b: Landmark, c: Landmark) {
   if (magAB === 0 || magCB === 0) return 0
   const cosine = clamp(dot / (magAB * magCB), -1, 1)
   return (Math.acos(cosine) * 180) / Math.PI
+}
+
+function distance2D(a: Landmark, b: Landmark) {
+  return Math.hypot(a.x - b.x, a.y - b.y)
+}
+
+function isVisible(lm: Landmark | undefined, min = POSE_MIN_VIS) {
+  return !!lm && (lm.visibility ?? 0) >= min
+}
+
+function ema(next: number, prev: number | null, alpha: number) {
+  if (prev === null) return next
+  return prev + alpha * (next - prev)
 }
 
 export default function Home() {
@@ -54,6 +83,12 @@ export default function Home() {
   const timerRef = useRef<number | NodeJS.Timeout | null>(null)
   const startTimestampRef = useRef<number | null>(null)
   const stageRef = useRef<Stage>('up')
+  const downFrameCountRef = useRef(0)
+  const upFrameCountRef = useRef(0)
+  const bottomHipYRef = useRef<number | null>(null)
+  const topHipYRef = useRef<number | null>(null)
+  const elbowEmaRef = useRef<number | null>(null)
+  const bodyEmaRef = useRef<number | null>(null)
 
   function formatDuration(totalSeconds: number) {
     const minutes = Math.floor(totalSeconds / 60)
@@ -103,6 +138,12 @@ export default function Home() {
     setIsCameraOn(false)
     setHandsDetected(0)
     setStatusText('Camera is off')
+    downFrameCountRef.current = 0
+    upFrameCountRef.current = 0
+    bottomHipYRef.current = null
+    topHipYRef.current = null
+    elbowEmaRef.current = null
+    bodyEmaRef.current = null
   }
 
   useEffect(() => {
@@ -155,34 +196,148 @@ export default function Home() {
     }
   }, [])
 
+  function getSideMetrics(landmarks: Landmark[], side: 'left' | 'right'): SideMetrics {
+    const shoulder = side === 'left' ? landmarks[11] : landmarks[12]
+    const elbow = side === 'left' ? landmarks[13] : landmarks[14]
+    const wrist = side === 'left' ? landmarks[15] : landmarks[16]
+    const hip = side === 'left' ? landmarks[23] : landmarks[24]
+    const ankle = side === 'left' ? landmarks[27] : landmarks[28]
+
+    const required = [shoulder, elbow, wrist, hip, ankle]
+    const visibleCount = required.filter((lm) => isVisible(lm)).length
+    const quality = visibleCount / required.length
+    const valid = visibleCount === required.length
+
+    if (!valid) {
+      return {
+        elbowAngle: 0,
+        bodyAngle: 0,
+        wristShoulderDx: 0,
+        quality,
+        valid: false,
+      }
+    }
+
+    return {
+      elbowAngle: angleABC(shoulder!, elbow!, wrist!),
+      bodyAngle: angleABC(shoulder!, hip!, ankle!),
+      wristShoulderDx: Math.abs(wrist!.x - shoulder!.x),
+      quality,
+      valid: true,
+    }
+  }
+
   function analyzePose(landmarks: Landmark[]) {
     if (!landmarks || landmarks.length < 29) return
 
-    const leftShoulder = landmarks[11], rightShoulder = landmarks[12]
-    const leftElbow = landmarks[13], rightElbow = landmarks[14]
-    const leftWrist = landmarks[15], rightWrist = landmarks[16]
-    const leftHip = landmarks[23]
+    const left = getSideMetrics(landmarks, 'left')
+    const right = getSideMetrics(landmarks, 'right')
+    const side = left.quality >= right.quality ? left : right
 
-    if (!leftShoulder || !rightShoulder || !leftElbow || !rightElbow) return
-
-    const leftElbowAngle = angleABC(leftShoulder, leftElbow, leftWrist)
-    const rightElbowAngle = angleABC(rightShoulder, rightElbow, rightWrist)
-    const avgElbowAngle = (leftElbowAngle + rightElbowAngle) / 2
-
-    let nextStage = stageRef.current
-    if (avgElbowAngle < 90) nextStage = 'down'
-    if (avgElbowAngle > 155 && stageRef.current === 'down') {
-      nextStage = 'up'
-      setRepCount((p) => p + 1)
+    if (!side.valid) {
+      setStatusText('Low landmark confidence. Keep full body in frame.')
+      setFeedback(['Move slightly farther from the camera and keep side view visible.'])
+      return
     }
-    stageRef.current = nextStage
+
+    const smoothedElbow = ema(side.elbowAngle, elbowEmaRef.current, ELBOW_ALPHA)
+    const smoothedBody = ema(side.bodyAngle, bodyEmaRef.current, BODY_ALPHA)
+    elbowEmaRef.current = smoothedElbow
+    bodyEmaRef.current = smoothedBody
+
+    const leftHip = landmarks[23]
+    const rightHip = landmarks[24]
+    const leftShoulder = landmarks[11]
+    const rightShoulder = landmarks[12]
+    const shoulderWidth = isVisible(leftShoulder) && isVisible(rightShoulder)
+      ? distance2D(leftShoulder!, rightShoulder!)
+      : 0.15
+    const hipY = isVisible(leftHip) && isVisible(rightHip)
+      ? (leftHip!.y + rightHip!.y) / 2
+      : side === left
+        ? (leftHip?.y ?? 0.5)
+        : (rightHip?.y ?? 0.5)
+
+    if (stageRef.current === 'up') {
+      if (topHipYRef.current === null || hipY < topHipYRef.current) {
+        topHipYRef.current = hipY
+      }
+    }
+    if (stageRef.current === 'down') {
+      if (bottomHipYRef.current === null || hipY > bottomHipYRef.current) {
+        bottomHipYRef.current = hipY
+      }
+    }
+
+    const isDownNow = smoothedElbow <= MIN_REP_DOWN_ANGLE
+    const isUpNow = smoothedElbow >= MIN_REP_UP_ANGLE
+
+    if (isDownNow) {
+      downFrameCountRef.current += 1
+    } else {
+      downFrameCountRef.current = 0
+    }
+
+    if (isUpNow) {
+      upFrameCountRef.current += 1
+    } else {
+      upFrameCountRef.current = 0
+    }
+
+    if (stageRef.current === 'up' && downFrameCountRef.current >= MIN_REP_FRAMES) {
+      stageRef.current = 'down'
+      bottomHipYRef.current = hipY
+    }
+
+    if (stageRef.current === 'down' && upFrameCountRef.current >= MIN_REP_FRAMES) {
+      const topHip = topHipYRef.current ?? hipY
+      const bottomHip = bottomHipYRef.current ?? hipY
+      const depthTravel = bottomHip - topHip
+      const normalizedDepth = shoulderWidth > 0 ? depthTravel / shoulderWidth : 0
+
+      if (normalizedDepth >= MIN_HIP_HEIGHT_DELTA) {
+        setRepCount((p) => p + 1)
+      }
+
+      stageRef.current = 'up'
+      topHipYRef.current = hipY
+      bottomHipYRef.current = null
+    }
 
     let score = 100
     const nextFeedback: string[] = []
 
-    if (nextFeedback.length === 0) nextFeedback.push('Good form. Keep it up!')
-    setQualityScore(Math.round(clamp(score, 0, 100)))
+    const bodyDeviation = Math.abs(180 - smoothedBody)
+    if (bodyDeviation > 16) {
+      score -= clamp((bodyDeviation - 16) * 1.7, 0, 35)
+      nextFeedback.push('Keep a straighter plank line from shoulders to ankles.')
+    }
+
+    if (side.wristShoulderDx < 0.035) {
+      score -= 12
+      nextFeedback.push('Place hands slightly wider for better pressing mechanics.')
+    }
+
+    if (smoothedElbow > 110 && stageRef.current === 'down') {
+      score -= clamp((smoothedElbow - 110) * 0.9, 0, 20)
+      nextFeedback.push('Go deeper at the bottom before pressing up.')
+    }
+
+    if (nextFeedback.length === 0) {
+      nextFeedback.push('Great rep quality. Keep your tempo controlled.')
+    }
+
+    const finalScore = Math.round(clamp(score, 0, 100))
+    setQualityScore(finalScore)
     setFeedback(nextFeedback)
+
+    if (finalScore >= 85) {
+      setStatusText('Form quality: strong')
+    } else if (finalScore >= 70) {
+      setStatusText('Form quality: fair')
+    } else {
+      setStatusText('Form quality: needs improvement')
+    }
   }
 
   function renderLoop() {
@@ -276,6 +431,16 @@ export default function Home() {
         // Wait until metadata loads to attach perfect aspect ratio logic immediately
         videoRef.current.onloadedmetadata = async () => {
           await videoRef.current?.play()
+          downFrameCountRef.current = 0
+          upFrameCountRef.current = 0
+          bottomHipYRef.current = null
+          topHipYRef.current = null
+          elbowEmaRef.current = null
+          bodyEmaRef.current = null
+          stageRef.current = 'up'
+          setRepCount(0)
+          setQualityScore(0)
+          setFeedback(['Camera started. Hold side view and begin controlled reps.'])
           setIsCameraOn(true)
           setStatusText('Camera active')
           startTimer()
