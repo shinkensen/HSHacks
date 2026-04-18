@@ -334,6 +334,11 @@ function InsightsSidebarBody({
     [heatMapActivityByDay],
   );
 
+  const hasHeatData = useMemo(
+    () => heatMapValues.some((entry) => entry.count > 0),
+    [heatMapValues],
+  );
+
   const heatMapStartDate = useMemo(() => {
     if (heatMapValues.length > 0) {
       const sorted = [...heatMapValues].sort((a, b) => a.date.localeCompare(b.date));
@@ -391,17 +396,29 @@ function InsightsSidebarBody({
           <SidebarGroupLabel className="px-2">Activity heatmap</SidebarGroupLabel>
           <SidebarGroupContent className="min-w-0 w-full max-w-full px-1 pb-2 sm:px-2">
             <div className="w-full min-w-0 max-w-full overflow-hidden rounded-md border border-border/30 bg-background px-1 py-2">
-              <ActivityHeatMap
-                value={heatMapValues}
-                startDate={heatMapStartDate}
-                width={252}
-                rectSize={9}
-                space={2}
-                legendCellSize={0}
-                weekLabels={["Sun", "", "Tue", "", "Thu", "", "Sat"]}
-                panelColors={["#e5e7eb", "#bbf7d0", "#86efac", "#22c55e", "#16a34a"]}
-                style={{ color: "#16a34a" }}
-              />
+              {hasHeatData ? (
+                <ActivityHeatMap
+                  value={heatMapValues}
+                  startDate={heatMapStartDate}
+                  width={252}
+                  rectSize={9}
+                  space={2}
+                  legendCellSize={0}
+                  weekLabels={["Sun", "", "Tue", "", "Thu", "", "Sat"]}
+                  panelColors={{
+                    0: "#e5e7eb",
+                    1: "#d1fae5",
+                    5: "#a7f3d0",
+                    10: "#6ee7b7",
+                    20: "#34d399",
+                    40: "#10b981",
+                  }}
+                />
+              ) : (
+                <div className="flex h-[104px] items-center justify-center rounded-sm border border-dashed border-border/40 bg-muted/20">
+                  <p className="text-xs text-muted-foreground">No activity yet</p>
+                </div>
+              )}
             </div>
             <p className="px-1 pt-1 text-[11px] text-muted-foreground">
               Last 6 months intensity

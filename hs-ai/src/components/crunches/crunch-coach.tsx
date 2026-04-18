@@ -2303,55 +2303,6 @@ export function CrunchCoach() {
             >
               {summaryPending ? "Summarizing..." : "End workout"}
             </Button>
-            <Button
-              className="min-h-9 flex-1 sm:flex-initial"
-              onClick={() => {
-                void (async () => {
-                  if (!isCameraOn) return;
-                  if (isMicMuted) {
-                    const ready = await ensureMicTrackAvailable();
-                    if (!ready) return;
-                    setIsMicMuted(false);
-                    setStatusText("Microphone unmuted.");
-                    return;
-                  }
-                  setIsMicMuted(true);
-                  setStatusText("Microphone muted.");
-                })();
-              }}
-              variant={isMicMuted ? "destructive" : "outline"}
-              disabled={!isCameraOn}
-            >
-              {isMicMuted ? "Mic muted" : "Mic on"}
-            </Button>
-            <Button
-              className="min-h-9 flex-1 sm:flex-initial"
-              onClick={() => {
-                setIsSpeakerMuted((prev) => {
-                  const next = !prev;
-                  if (!next) {
-                    void ensureRemotePlayback();
-                  }
-                  return next;
-                });
-              }}
-              variant={isSpeakerMuted ? "destructive" : "outline"}
-            >
-              {isSpeakerMuted ? "Speaker muted" : "Speaker on"}
-            </Button>
-            <Button
-              className="min-h-9 flex-1 sm:flex-initial"
-              onClick={() => {
-                if (micTestState === "testing") {
-                  stopMicTest();
-                } else {
-                  void startMicTest();
-                }
-              }}
-              variant={micTestState === "testing" ? "destructive" : "outline"}
-            >
-              {micTestState === "testing" ? "Stop mic test" : "Test mic"}
-            </Button>
           </div>
         </header>
 
