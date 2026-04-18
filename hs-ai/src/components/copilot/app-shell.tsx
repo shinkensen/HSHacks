@@ -296,7 +296,7 @@ function InsightsSidebarBody({
     const map = new Map<string, number>();
     for (const day of calendarDays) {
       const value = isWorkoutMode
-        ? day.workouts ?? 0
+        ? day.totalReps ?? day.workouts ?? 0
         : day.sessionsCompleted ?? day.stepsCompleted ?? 0;
       map.set(day.dayKey, Math.max(0, Math.floor(value)));
     }
@@ -392,7 +392,7 @@ function InsightsSidebarBody({
         <SidebarGroup className="px-0 sm:px-1">
           <SidebarGroupLabel className="px-2">Activity heatmap</SidebarGroupLabel>
           <SidebarGroupContent className="min-w-0 w-full max-w-full px-1 pb-2 sm:px-2">
-            <div className="w-full min-w-0 max-w-full overflow-hidden rounded-md border border-border/30 bg-muted/15 px-1 py-2">
+            <div className="w-full min-w-0 max-w-full overflow-hidden rounded-md border border-border/30 bg-background px-1 py-2">
               <ActivityHeatMap
                 value={heatMapValues}
                 startDate={heatMapStartDate}
@@ -401,12 +401,17 @@ function InsightsSidebarBody({
                 space={2}
                 legendCellSize={0}
                 weekLabels={["", "", "", "", "", "", ""]}
-                panelColors={["#edf4ee", "#cfe4d2", "#98ca9f", "#57a468", "#1f6b39"]}
-                style={{ color: "#2f6f3d", width: "100%", display: "block" }}
+                panelColors={["#e5e7eb", "#bbf7d0", "#86efac", "#22c55e", "#16a34a"]}
+                style={{
+                  width: "100%",
+                  display: "block",
+                  color: "#16a34a",
+                  "--rhm-rect": "#e5e7eb",
+                } as React.CSSProperties}
               />
             </div>
             <p className="px-1 pt-1 text-[11px] text-muted-foreground">
-              Last 6 months by workout days
+              Last 6 months intensity
             </p>
           </SidebarGroupContent>
         </SidebarGroup>
