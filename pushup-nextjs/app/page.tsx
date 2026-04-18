@@ -77,6 +77,8 @@ const SHARE_PUSH_INTERVAL_MS = 100
 const SHARE_PULL_INTERVAL_MS = 180
 const SIGNAL_PULL_INTERVAL_MS = 300
 const LEADERBOARD_PUSH_THROTTLE_MS = 120
+const PRESENCE_HEARTBEAT_MS = 2000
+const DEVICE_ID_STORAGE_KEY = 'pushup-room-device-id'
 
 const SHOULDER_L = 11
 const SHOULDER_R = 12
@@ -210,6 +212,7 @@ export default function Home() {
   const remoteFeedsRef = useRef<RemoteDeviceFeed[]>([])
   const remoteMediaFeedsRef = useRef<RemoteMediaFeed[]>([])
   const signalPollTimerRef = useRef<number | null>(null)
+  const presenceTimerRef = useRef<number | null>(null)
   const signalCursorRef = useRef(0)
   const peerConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map())
   const shareAlertTimerRef = useRef<number | null>(null)
@@ -220,18 +223,60 @@ export default function Home() {
     return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
   }
 
-  useEffect(() => {
-    if (deviceIdRef.current === 'dev-pending') {
-      deviceIdRef.current = `dev-${randomId()}`
+  function ensureDeviceId() {
+    if (deviceIdRef.current !== 'dev-pending') {
+      return deviceIdRef.current
     }
+
+    if (typeof window !== 'undefined') {
+      const stored = window.localStorage.getItem(DEVICE_ID_STORAGE_KEY)
+      if (stored && stored.trim()) {
+        deviceIdRef.current = stored
+        return deviceIdRef.current
+      }
+      const created = `dev-${randomId()}`
+      deviceIdRef.current = created
+      window.localStorage.setItem(DEVICE_ID_STORAGE_KEY, created)
+      return deviceIdRef.current
+    }
+
+    return deviceIdRef.current
+  }
+
+  useEffect(() => {
+    const id = ensureDeviceId()
     if (!username) {
-      setUsername(`User-${deviceIdRef.current.slice(-4)}`)
+      setUsername(`User-${id.slice(-4)}`)
     }
   }, [username])
 
+  function getRoomPayload() {
+    const stableDeviceId = ensureDeviceId()
+    return {
+      deviceId: stableDeviceId,
+      username: username.trim() || `User-${stableDeviceId.slice(-4)}`,
+      reps: repCount,
+      updatedAt: Date.now(),
+    }
+  }
+
+  async function pushRoomPresence() {
+    if (!shareEnabled || !roomId.trim()) return
+    const payload = getRoomPayload()
+    await fetch(`/api/rooms/${encodeURIComponent(roomId.trim())}/landmarks`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...payload,
+        poseLandmarks: [],
+        handLandmarks: [],
+      }),
+    })
+  }
+
   const leaderboard = [
     {
-      deviceId: deviceIdRef.current,
+      deviceId: ensureDeviceId(),
       username: username.trim() || 'You',
       reps: repCount,
       isSelf: true,
@@ -269,8 +314,8 @@ export default function Home() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        deviceId: deviceIdRef.current,
-        username: username.trim() || `User-${deviceIdRef.current.slice(-4)}`,
+        deviceId: ensureDeviceId(),
+        username: username.trim() || `User-${ensureDeviceId().slice(-4)}`,
         reps: repCount,
         updatedAt: Date.now(),
         poseLandmarks: [],
@@ -297,7 +342,7 @@ export default function Home() {
           return
         }
         const data = (await response.json()) as { devices?: RemoteDeviceFeed[] }
-        const devices = (data.devices ?? []).filter((d) => d.deviceId !== deviceIdRef.current)
+        const devices = (data.devices ?? []).filter((d) => d.deviceId !== ensureDeviceId())
         setRemoteFeeds(devices)
         if (roomJoinState === 'joined') {
           setRoomProgressText(
@@ -322,8 +367,30 @@ export default function Home() {
     }
   }, [shareEnabled, roomId, roomJoinState])
 
+  useEffect(() => {
+    if (!shareEnabled || !roomId.trim()) {
+      if (presenceTimerRef.current !== null) {
+        window.clearInterval(presenceTimerRef.current)
+        presenceTimerRef.current = null
+      }
+      return
+    }
+
+    void pushRoomPresence()
+    presenceTimerRef.current = window.setInterval(() => {
+      void pushRoomPresence()
+    }, PRESENCE_HEARTBEAT_MS)
+
+    return () => {
+      if (presenceTimerRef.current !== null) {
+        window.clearInterval(presenceTimerRef.current)
+        presenceTimerRef.current = null
+      }
+    }
+  }, [shareEnabled, roomId, username, repCount])
+
   function shouldInitiateWith(remoteDeviceId: string) {
-    return deviceIdRef.current < remoteDeviceId
+    return ensureDeviceId() < remoteDeviceId
   }
 
   function upsertRemoteMedia(deviceId: string, stream: MediaStream) {
@@ -355,7 +422,7 @@ export default function Home() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        fromDeviceId: deviceIdRef.current,
+        fromDeviceId: ensureDeviceId(),
         toDeviceId,
         type,
         payload,
@@ -452,7 +519,7 @@ export default function Home() {
 
   async function handleSignalMessage(message: SignalMessage) {
     const remoteDeviceId = message.fromDeviceId
-    if (!remoteDeviceId || remoteDeviceId === deviceIdRef.current) return
+    if (!remoteDeviceId || remoteDeviceId === ensureDeviceId()) return
 
     if (message.type === 'join') {
       ensurePeer(remoteDeviceId)
@@ -508,7 +575,7 @@ export default function Home() {
     const poll = async () => {
       try {
         const response = await fetch(
-          `/api/rooms/${encodeURIComponent(activeRoomId)}/signals?deviceId=${encodeURIComponent(deviceIdRef.current)}&since=${signalCursorRef.current}`,
+          `/api/rooms/${encodeURIComponent(activeRoomId)}/signals?deviceId=${encodeURIComponent(ensureDeviceId())}&since=${signalCursorRef.current}`,
           { cache: 'no-store' },
         )
         if (!response.ok) {
@@ -547,8 +614,8 @@ export default function Home() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          deviceId: deviceIdRef.current,
-          username: username.trim() || `User-${deviceIdRef.current.slice(-4)}`,
+          deviceId: ensureDeviceId(),
+          username: username.trim() || `User-${ensureDeviceId().slice(-4)}`,
           reps: repCount,
           updatedAt: Date.now(),
           poseLandmarks: [],
@@ -595,8 +662,8 @@ export default function Home() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          deviceId: deviceIdRef.current,
-          username: username.trim() || `User-${deviceIdRef.current.slice(-4)}`,
+          deviceId: ensureDeviceId(),
+          username: username.trim() || `User-${ensureDeviceId().slice(-4)}`,
           reps: repCount,
           updatedAt: Date.now(),
           poseLandmarks: [],
@@ -605,7 +672,7 @@ export default function Home() {
       })
 
       const data = (await response.json()) as { devices?: RemoteDeviceFeed[] }
-      const devices = (data.devices ?? []).filter((d) => d.deviceId !== deviceIdRef.current)
+      const devices = (data.devices ?? []).filter((d) => d.deviceId !== ensureDeviceId())
 
       setShareEnabled(true)
       setRemoteFeeds(devices)
@@ -653,6 +720,10 @@ export default function Home() {
     if (shareAlertTimerRef.current !== null) {
       window.clearTimeout(shareAlertTimerRef.current)
       shareAlertTimerRef.current = null
+    }
+    if (presenceTimerRef.current !== null) {
+      window.clearInterval(presenceTimerRef.current)
+      presenceTimerRef.current = null
     }
     setShowShareCameraAlert(false)
     void sendSignal('leave').catch(() => undefined)
@@ -731,6 +802,10 @@ export default function Home() {
       cancelled = true
       stopSignalPolling()
       closeAllPeers()
+      if (presenceTimerRef.current !== null) {
+        window.clearInterval(presenceTimerRef.current)
+        presenceTimerRef.current = null
+      }
       stopCamera()
       poseLandmarkerRef.current?.close()
       handLandmarkerRef.current?.close()
@@ -1002,8 +1077,8 @@ export default function Home() {
         if (t - lastSharePushAtRef.current >= SHARE_PUSH_INTERVAL_MS) {
           lastSharePushAtRef.current = t
           const payload = {
-            deviceId: deviceIdRef.current,
-            username: username.trim() || `User-${deviceIdRef.current.slice(-4)}`,
+            deviceId: ensureDeviceId(),
+            username: username.trim() || `User-${ensureDeviceId().slice(-4)}`,
             reps: repCount,
             updatedAt: Date.now(),
             poseLandmarks: poses.map((lm) => ({
@@ -1214,7 +1289,7 @@ export default function Home() {
           </div>
           <p className="text-xs text-neutral-300">Room status: {roomProgressText}</p>
           <p className="text-xs text-neutral-400">
-            Device ID: {deviceIdRef.current}
+            Device ID: {ensureDeviceId()}
           </p>
         </div>
 
