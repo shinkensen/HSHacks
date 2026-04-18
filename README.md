@@ -1,18 +1,4 @@
-<<<<<<< HEAD
-<<<<<<< HEAD
-<<<<<<< HEAD
-# HS Hacks Prompt:
-The actual problem worth solving:
-High-output people — builders, students, founders — don't burn out because they work too hard. They burn out because they lose the why behind the work, and they have no system to notice it happening until the damage is done. By the time they feel it, they're already cooked.
-  
-=======
-# MomentumAI
-=======
-# moment.ai
->>>>>>> ecf7ae1 (add readme)
-=======
 # momentum.ai
->>>>>>> 13bd594 (add)
 
 momentum.ai is a mental wellbeing web application centered on personal growth, both individually and through meaningful connections with others. By combining AI guidance, physical activity, and task completion, momentum.ai creates a holistic system that helps users build healthier habits, stay motivated, and feel more in control of their lives. Whether someone is looking to improve their mental health or maintain it, momentum.ai provides a structured yet engaging experience.
 
@@ -47,18 +33,4 @@ Integrated AI-driven task assistance
 
 ## Some Problems we ran into
 
-<<<<<<< HEAD
-<<<<<<< HEAD
-
-
-
-
-
-
-
->>>>>>> 04d923a (readme done)
-=======
->>>>>>> 5ffc7b8 (third readme change)
-=======
 One of the biggest challenges was implementing accurate motion detection. Integrating MediaPipe with our existing frontend required careful coordination to ensure real-time responsiveness and reliability. Achieving smooth, seamless interaction between the motion recognition system and the user interface was critical—and ultimately one of the most rewarding aspects of development.
->>>>>>> ecf7ae1 (add readme)
