@@ -30,9 +30,27 @@ type WireLandmark = {
 
 type RemoteDeviceFeed = {
   deviceId: string
+  username: string
+  reps: number
   updatedAt: number
   poseLandmarks: WireLandmark[]
   handLandmarks: WireLandmark[][]
+}
+
+type RemoteMediaFeed = {
+  deviceId: string
+  stream: MediaStream
+}
+
+type SignalType = 'join' | 'leave' | 'offer' | 'answer' | 'ice'
+
+type SignalMessage = {
+  id: number
+  fromDeviceId: string
+  toDeviceId?: string
+  type: SignalType
+  payload?: unknown
+  createdAt: number
 }
 
 type RoomJoinState = 'idle' | 'creating' | 'joining' | 'joined' | 'error'
@@ -57,6 +75,7 @@ const BODY_ALPHA = 0.22
 const REP_COOLDOWN_MS = 280
 const SHARE_PUSH_INTERVAL_MS = 100
 const SHARE_PULL_INTERVAL_MS = 180
+const SIGNAL_PULL_INTERVAL_MS = 300
 
 const SHOULDER_L = 11
 const SHOULDER_R = 12
@@ -132,6 +151,20 @@ function roomColorFromId(deviceId: string) {
   return palette[hash % palette.length]
 }
 
+function toSignalDescription(payload: unknown): RTCSessionDescriptionInit | null {
+  if (!payload || typeof payload !== 'object') return null
+  const maybe = payload as { type?: string; sdp?: string }
+  if (!maybe.type) return null
+  return { type: maybe.type as RTCSdpType, sdp: maybe.sdp }
+}
+
+function toIceCandidate(payload: unknown): RTCIceCandidateInit | null {
+  if (!payload || typeof payload !== 'object') return null
+  const maybe = payload as RTCIceCandidateInit
+  if (!maybe.candidate) return null
+  return maybe
+}
+
 export default function Home() {
   const [isCameraOn, setIsCameraOn] = useState(false)
   const [statusText, setStatusText] = useState('Loading models...')
@@ -140,9 +173,11 @@ export default function Home() {
   const [handsDetected, setHandsDetected] = useState(0)
   const [elapsedSeconds, setElapsedSeconds] = useState(0)
   const [feedback, setFeedback] = useState<string[]>(['Press Start Camera and begin pushups in profile view.'])
+  const [username, setUsername] = useState('')
   const [roomId, setRoomId] = useState('pushups')
   const [shareEnabled, setShareEnabled] = useState(false)
   const [remoteFeeds, setRemoteFeeds] = useState<RemoteDeviceFeed[]>([])
+  const [remoteMediaFeeds, setRemoteMediaFeeds] = useState<RemoteMediaFeed[]>([])
   const [roomJoinState, setRoomJoinState] = useState<RoomJoinState>('idle')
   const [roomProgressText, setRoomProgressText] = useState('Not connected to a room yet.')
 
@@ -170,6 +205,10 @@ export default function Home() {
   const deviceIdRef = useRef('dev-pending')
   const lastSharePushAtRef = useRef(0)
   const remoteFeedsRef = useRef<RemoteDeviceFeed[]>([])
+  const remoteMediaFeedsRef = useRef<RemoteMediaFeed[]>([])
+  const signalPollTimerRef = useRef<number | null>(null)
+  const signalCursorRef = useRef(0)
+  const peerConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map())
 
   function formatDuration(totalSeconds: number) {
     const minutes = Math.floor(totalSeconds / 60)
@@ -181,11 +220,35 @@ export default function Home() {
     if (deviceIdRef.current === 'dev-pending') {
       deviceIdRef.current = `dev-${randomId()}`
     }
-  }, [])
+    if (!username) {
+      setUsername(`User-${deviceIdRef.current.slice(-4)}`)
+    }
+  }, [username])
+
+  const leaderboard = [
+    {
+      deviceId: deviceIdRef.current,
+      username: username.trim() || 'You',
+      reps: repCount,
+      isSelf: true,
+    },
+    ...remoteFeeds.map((feed) => ({
+      deviceId: feed.deviceId,
+      username: feed.username || feed.deviceId,
+      reps: Number.isFinite(feed.reps) ? feed.reps : 0,
+      isSelf: false,
+    })),
+  ]
+    .sort((a, b) => b.reps - a.reps)
+    .slice(0, 10)
 
   useEffect(() => {
     remoteFeedsRef.current = remoteFeeds
   }, [remoteFeeds])
+
+  useEffect(() => {
+    remoteMediaFeedsRef.current = remoteMediaFeeds
+  }, [remoteMediaFeeds])
 
   useEffect(() => {
     if (!shareEnabled || !roomId.trim()) {
@@ -230,6 +293,215 @@ export default function Home() {
     }
   }, [shareEnabled, roomId, roomJoinState])
 
+  function shouldInitiateWith(remoteDeviceId: string) {
+    return deviceIdRef.current < remoteDeviceId
+  }
+
+  function upsertRemoteMedia(deviceId: string, stream: MediaStream) {
+    setRemoteMediaFeeds((prev) => {
+      const existingIndex = prev.findIndex((item) => item.deviceId === deviceId)
+      if (existingIndex === -1) {
+        return [...prev, { deviceId, stream }]
+      }
+      const next = [...prev]
+      next[existingIndex] = { deviceId, stream }
+      return next
+    })
+  }
+
+  function removeRemoteMedia(deviceId: string) {
+    setRemoteMediaFeeds((prev) => prev.filter((item) => item.deviceId !== deviceId))
+  }
+
+  async function sendSignal(
+    type: SignalType,
+    payload?: unknown,
+    toDeviceId?: string,
+    overrideRoomId?: string,
+  ) {
+    const normalizedRoomId = (overrideRoomId ?? roomId).trim()
+    if (!normalizedRoomId) return
+
+    await fetch(`/api/rooms/${encodeURIComponent(normalizedRoomId)}/signals`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        fromDeviceId: deviceIdRef.current,
+        toDeviceId,
+        type,
+        payload,
+      }),
+    })
+  }
+
+  function closePeer(remoteDeviceId: string) {
+    const existing = peerConnectionsRef.current.get(remoteDeviceId)
+    if (existing) {
+      existing.onicecandidate = null
+      existing.ontrack = null
+      existing.onconnectionstatechange = null
+      existing.close()
+      peerConnectionsRef.current.delete(remoteDeviceId)
+    }
+    removeRemoteMedia(remoteDeviceId)
+  }
+
+  function closeAllPeers() {
+    for (const remoteDeviceId of peerConnectionsRef.current.keys()) {
+      closePeer(remoteDeviceId)
+    }
+  }
+
+  function ensurePeer(remoteDeviceId: string) {
+    const existing = peerConnectionsRef.current.get(remoteDeviceId)
+    if (existing) {
+      return existing
+    }
+
+    const pc = new RTCPeerConnection({
+      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+    })
+
+    const localStream = streamRef.current
+    if (localStream) {
+      for (const track of localStream.getTracks()) {
+        pc.addTrack(track, localStream)
+      }
+    }
+
+    pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        void sendSignal('ice', event.candidate.toJSON(), remoteDeviceId)
+      }
+    }
+
+    pc.ontrack = (event) => {
+      const firstStream = event.streams[0]
+      if (firstStream) {
+        upsertRemoteMedia(remoteDeviceId, firstStream)
+      }
+    }
+
+    pc.onconnectionstatechange = () => {
+      const state = pc.connectionState
+      if (state === 'failed' || state === 'closed' || state === 'disconnected') {
+        closePeer(remoteDeviceId)
+      }
+    }
+
+    peerConnectionsRef.current.set(remoteDeviceId, pc)
+    return pc
+  }
+
+  async function createOfferFor(remoteDeviceId: string) {
+    const pc = ensurePeer(remoteDeviceId)
+    const offer = await pc.createOffer()
+    await pc.setLocalDescription(offer)
+    await sendSignal('offer', offer, remoteDeviceId)
+  }
+
+  async function attachTracksAndRenegotiate() {
+    const localStream = streamRef.current
+    if (!localStream) return
+
+    for (const [remoteDeviceId, pc] of peerConnectionsRef.current.entries()) {
+      const hasVideoSender = pc
+        .getSenders()
+        .some((sender) => sender.track?.kind === 'video' || sender.track?.kind === 'audio')
+
+      if (!hasVideoSender) {
+        for (const track of localStream.getTracks()) {
+          pc.addTrack(track, localStream)
+        }
+      }
+
+      if (shouldInitiateWith(remoteDeviceId)) {
+        await createOfferFor(remoteDeviceId)
+      }
+    }
+  }
+
+  async function handleSignalMessage(message: SignalMessage) {
+    const remoteDeviceId = message.fromDeviceId
+    if (!remoteDeviceId || remoteDeviceId === deviceIdRef.current) return
+
+    if (message.type === 'join') {
+      ensurePeer(remoteDeviceId)
+      if (shouldInitiateWith(remoteDeviceId)) {
+        await createOfferFor(remoteDeviceId)
+      }
+      return
+    }
+
+    if (message.type === 'leave') {
+      closePeer(remoteDeviceId)
+      return
+    }
+
+    if (message.type === 'offer') {
+      const offer = toSignalDescription(message.payload)
+      if (!offer) return
+      const pc = ensurePeer(remoteDeviceId)
+      await pc.setRemoteDescription(new RTCSessionDescription(offer))
+      const answer = await pc.createAnswer()
+      await pc.setLocalDescription(answer)
+      await sendSignal('answer', answer, remoteDeviceId)
+      return
+    }
+
+    if (message.type === 'answer') {
+      const answer = toSignalDescription(message.payload)
+      if (!answer) return
+      const pc = ensurePeer(remoteDeviceId)
+      await pc.setRemoteDescription(new RTCSessionDescription(answer))
+      return
+    }
+
+    if (message.type === 'ice') {
+      const candidate = toIceCandidate(message.payload)
+      if (!candidate) return
+      const pc = ensurePeer(remoteDeviceId)
+      await pc.addIceCandidate(candidate)
+    }
+  }
+
+  function stopSignalPolling() {
+    if (signalPollTimerRef.current !== null) {
+      window.clearInterval(signalPollTimerRef.current)
+      signalPollTimerRef.current = null
+    }
+  }
+
+  function startSignalPolling(activeRoomId: string) {
+    stopSignalPolling()
+    signalCursorRef.current = 0
+
+    const poll = async () => {
+      try {
+        const response = await fetch(
+          `/api/rooms/${encodeURIComponent(activeRoomId)}/signals?deviceId=${encodeURIComponent(deviceIdRef.current)}&since=${signalCursorRef.current}`,
+          { cache: 'no-store' },
+        )
+        if (!response.ok) {
+          return
+        }
+        const data = (await response.json()) as { messages?: SignalMessage[] }
+        const messages = data.messages ?? []
+        for (const message of messages) {
+          signalCursorRef.current = Math.max(signalCursorRef.current, message.id)
+          await handleSignalMessage(message)
+        }
+      } catch {
+        setRoomProgressText('Signaling interrupted. Retrying...')
+      }
+    }
+
+    void poll()
+    signalPollTimerRef.current = window.setInterval(() => {
+      void poll()
+    }, SIGNAL_PULL_INTERVAL_MS)
+  }
+
   async function createRoom() {
     const normalizedRoomId = roomId.trim()
     if (!normalizedRoomId) {
@@ -247,6 +519,8 @@ export default function Home() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           deviceId: deviceIdRef.current,
+          username: username.trim() || `User-${deviceIdRef.current.slice(-4)}`,
+          reps: repCount,
           updatedAt: Date.now(),
           poseLandmarks: [],
           handLandmarks: [],
@@ -259,6 +533,8 @@ export default function Home() {
 
       setShareEnabled(true)
       setRemoteFeeds([])
+      startSignalPolling(normalizedRoomId)
+      await sendSignal('join', undefined, undefined, normalizedRoomId)
       setRoomJoinState('joined')
       setRoomProgressText(`Room "${normalizedRoomId}" created. Waiting for peers...`)
     } catch {
@@ -286,11 +562,26 @@ export default function Home() {
         throw new Error('Join room failed')
       }
 
+      await fetch(`/api/rooms/${encodeURIComponent(normalizedRoomId)}/landmarks`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          deviceId: deviceIdRef.current,
+          username: username.trim() || `User-${deviceIdRef.current.slice(-4)}`,
+          reps: repCount,
+          updatedAt: Date.now(),
+          poseLandmarks: [],
+          handLandmarks: [],
+        }),
+      })
+
       const data = (await response.json()) as { devices?: RemoteDeviceFeed[] }
       const devices = (data.devices ?? []).filter((d) => d.deviceId !== deviceIdRef.current)
 
       setShareEnabled(true)
       setRemoteFeeds(devices)
+      startSignalPolling(normalizedRoomId)
+      await sendSignal('join', undefined, undefined, normalizedRoomId)
       setRoomJoinState('joined')
       setRoomProgressText(
         `Joined room "${normalizedRoomId}" successfully. Peers online: ${devices.length}.`,
@@ -330,6 +621,10 @@ export default function Home() {
       streamRef.current.getTracks().forEach((track) => track.stop())
       streamRef.current = null
     }
+    void sendSignal('leave').catch(() => undefined)
+    stopSignalPolling()
+    closeAllPeers()
+    setRemoteMediaFeeds([])
     if (videoRef.current) {
       videoRef.current.pause()
       videoRef.current.srcObject = null
@@ -400,6 +695,8 @@ export default function Home() {
     initLandmarker()
     return () => {
       cancelled = true
+      stopSignalPolling()
+      closeAllPeers()
       stopCamera()
       poseLandmarkerRef.current?.close()
       handLandmarkerRef.current?.close()
@@ -672,6 +969,8 @@ export default function Home() {
           lastSharePushAtRef.current = t
           const payload = {
             deviceId: deviceIdRef.current,
+            username: username.trim() || `User-${deviceIdRef.current.slice(-4)}`,
+            reps: repCount,
             updatedAt: Date.now(),
             poseLandmarks: poses.map((lm) => ({
               x: lm.x,
@@ -767,6 +1066,7 @@ export default function Home() {
           setStatusText('Camera active')
           startTimer()
           lastVideoTimeRef.current = -1
+          await attachTracksAndRenegotiate()
           requestAnimationFrame(renderLoop)
         }
       }
@@ -815,6 +1115,16 @@ export default function Home() {
             Use the same room ID on all devices. Relay is handled by this server (Redis enabled).
           </p>
           <label className="text-sm space-y-1 block">
+            <span className="text-neutral-300">Username</span>
+            <input
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
+              className="w-full rounded bg-neutral-900 border border-neutral-700 px-3 py-2"
+              placeholder="your-name"
+              maxLength={32}
+            />
+          </label>
+          <label className="text-sm space-y-1 block">
             <span className="text-neutral-300">Room name</span>
             <input
               value={roomId}
@@ -844,6 +1154,52 @@ export default function Home() {
             Device ID: {deviceIdRef.current}
           </p>
         </div>
+
+        <div className="bg-neutral-800 p-4 rounded-lg space-y-3">
+          <h2 className="font-semibold">Room Leaderboard</h2>
+          <p className="text-xs text-neutral-400">Top reps in this room (live)</p>
+          <div className="space-y-2">
+            {leaderboard.map((entry, index) => (
+              <div
+                key={entry.deviceId}
+                className="flex items-center justify-between rounded bg-neutral-900 px-3 py-2 text-sm"
+              >
+                <div className="flex items-center gap-2">
+                  <span className="text-neutral-400">#{index + 1}</span>
+                  <span className="font-medium">
+                    {entry.username}
+                    {entry.isSelf ? ' (You)' : ''}
+                  </span>
+                </div>
+                <span className="font-bold text-emerald-300">{entry.reps}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {remoteMediaFeeds.length > 0 && (
+          <div className="bg-neutral-800 p-4 rounded-lg space-y-3">
+            <h2 className="font-semibold">Peer Camera Feeds</h2>
+            <div className="grid md:grid-cols-2 gap-3">
+              {remoteMediaFeeds.map((feed) => (
+                <div key={feed.deviceId} className="rounded border border-neutral-700 overflow-hidden bg-black">
+                  <video
+                    className="w-full aspect-video object-cover"
+                    autoPlay
+                    playsInline
+                    muted
+                    ref={(node) => {
+                      if (node && node.srcObject !== feed.stream) {
+                        node.srcObject = feed.stream
+                      }
+                    }}
+                  />
+                  <p className="px-2 py-1 text-xs text-neutral-300">Peer: {feed.deviceId}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
 
         <div className="flex gap-4 justify-center">
           <button onClick={startCamera} disabled={isCameraOn} className="px-6 py-2 bg-emerald-600 hover:bg-emerald-500 rounded font-semibold disabled:opacity-50 text-white">Start Camera</button>

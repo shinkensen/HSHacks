@@ -9,6 +9,8 @@ type WireLandmark = {
 
 type DeviceFeed = {
   deviceId: string
+  username: string
+  reps: number
   updatedAt: number
   poseLandmarks: WireLandmark[]
   handLandmarks: WireLandmark[][]
@@ -21,6 +23,7 @@ type RoomStore = {
 const STALE_MS = 12000
 const ROOM_ID_MAX = 64
 const DEVICE_ID_MAX = 80
+const USERNAME_MAX = 32
 
 const REDIS_REST_URL = process.env.UPSTASH_REDIS_REST_URL
 const REDIS_REST_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN
@@ -47,6 +50,13 @@ function safeRoomId(roomId: string) {
 
 function safeDeviceId(deviceId: string) {
   return deviceId.trim().slice(0, DEVICE_ID_MAX)
+}
+
+function safeUsername(username: string | undefined) {
+  const fallback = 'Anonymous'
+  if (!username || typeof username !== 'string') return fallback
+  const trimmed = username.trim().slice(0, USERNAME_MAX)
+  return trimmed || fallback
 }
 
 function roomDataKey(roomId: string) {
@@ -177,8 +187,14 @@ export async function POST(
   }
 
   const normalizedDeviceId = safeDeviceId(body.deviceId)
+  const normalizedUsername = safeUsername((body as DeviceFeed).username)
+  const normalizedReps = Number.isFinite((body as DeviceFeed).reps)
+    ? Math.max(0, Math.floor((body as DeviceFeed).reps))
+    : 0
   const nextFeed: DeviceFeed = {
     deviceId: normalizedDeviceId,
+    username: normalizedUsername,
+    reps: normalizedReps,
     updatedAt: Date.now(),
     poseLandmarks: Array.isArray(body.poseLandmarks) ? body.poseLandmarks : [],
     handLandmarks: Array.isArray(body.handLandmarks) ? body.handLandmarks : [],
